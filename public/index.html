@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Legio Online</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:#1b1712;color:#e9dfc8;font-family:Georgia,serif;overflow:hidden}
+  #lobby{max-width:460px;margin:8vh auto;padding:28px;background:#2a231a;border:2px solid #8a6d2f;border-radius:6px;text-align:center}
+  h1{margin:0 0 4px;letter-spacing:4px;color:#d9b45a}
+  p.sub{margin:0 0 20px;color:#a9987a;font-style:italic}
+  input,button{font:inherit;padding:10px 14px;margin:5px;border-radius:4px;border:1px solid #8a6d2f;background:#14110c;color:#e9dfc8}
+  button{background:#7a1f1a;cursor:pointer;border-color:#b3422f}
+  button:hover{background:#9b2a22}
+  #roomView{display:none}
+  .pl{padding:6px;margin:4px 0;background:#14110c;border-radius:3px}
+  #err{color:#e0735a;min-height:1.2em}
+  #game{display:none;position:fixed;inset:0}
+  canvas{display:block;width:100vw;height:100vh;background:#4d5b2f;cursor:crosshair}
+  #hud{position:fixed;top:8px;left:8px;background:#000a;padding:8px 12px;border-radius:4px;font-size:14px;pointer-events:none}
+  #end{z-index:20;display:none;position:fixed;inset:0;background:#000b;align-items:center;justify-content:center;flex-direction:column;font-size:36px}
+  #camp{display:none;position:fixed;inset:0;background:#241e15;z-index:5}
+  #map{position:absolute;left:0;top:0;width:calc(100vw - 320px);height:100vh;background:radial-gradient(#3b3626,#1e1a12)}
+  #panel{position:absolute;right:0;top:0;width:320px;height:100vh;background:#2a231a;border-left:2px solid #8a6d2f;padding:14px;overflow:auto;font-size:14px}
+  #panel h2{margin:0 0 6px;color:#d9b45a}
+  #panel button{display:block;width:100%;margin:4px 0;text-align:left}
+  #panel button:disabled{opacity:.4;cursor:default}
+  #log div{color:#bba983;margin:2px 0;font-size:13px}
+  .prov{cursor:pointer}
+</style>
+</head>
+<body>
+<div id="lobby">
+  <h1>LEGIO ONLINE</h1>
+  <p class="sub">Command your cohorts. Crush your rival.</p>
+  <div id="menu">
+    <input id="name" placeholder="Your name" maxlength="16"><br>
+    <button id="btnCreate">Create Battle</button>
+    <button id="btnCamp">Create Campaign</button>
+    <button id="btnPractice">Practice vs AI</button>
+    <button id="btnCampAI">Campaign vs AI</button><br>
+    <input id="code" placeholder="Room code" maxlength="4" style="width:120px;text-transform:uppercase">
+    <button id="btnJoin">Join</button>
+  </div>
+  <div id="roomView">
+    <div id="modeLabel" style="color:#a9987a"></div><div>Room code: <b id="roomCode" style="font-size:28px;letter-spacing:4px"></b></div>
+    <div id="players"></div>
+    <button id="btnReady">Ready for battle</button>
+  </div>
+  <div id="err"></div>
+  <p style="font-size:12px;color:#8b7c60;margin-top:18px">Battles - left-click / drag: select &middot; Right-click ground: move &middot; Right-click enemy: attack &middot; S: stop</p>
+</div>
+<div id="camp"><svg id="map" viewBox="0 0 1000 600" preserveAspectRatio="xMidYMid meet"></svg><div id="panel"></div></div>
+<div id="game"><canvas id="cv"></canvas><div id="hud"></div></div>
+<div id="end"><div id="endText"></div><button id="btnAgain" style="font-size:20px">Return to lobby</button></div>
+<script src="client.js"></script>
+<script src="campaign.js"></script>
+</body>
+</html>

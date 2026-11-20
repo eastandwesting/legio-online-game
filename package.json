@@ -1,0 +1,16 @@
+{
+  "name": "legio-online",
+  "version": "0.1.0",
+  "description": "Original real-time ancient-world battle game with online multiplayer",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/bots.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
