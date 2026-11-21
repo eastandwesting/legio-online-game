@@ -128,3 +128,7 @@ slower core. The former 200 would have needed 8 to 20 ms: 80% of the allowance a
 more than all of it, so ticks run late and battles slow down. (Event-loop delay stayed within timer
 resolution at every size on the test machine, so it does not show the limit; the arithmetic against the
 quota does. Raise `MAX_ROOMS` on a paid plan with more CPU.)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -2,6 +2,7 @@
   "name": "legio-online",
   "version": "0.1.0",
   "description": "Original real-time ancient-world battle game with online multiplayer",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "start": "node server.js",
