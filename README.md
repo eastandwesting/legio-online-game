@@ -4,6 +4,9 @@ An original ancient-world strategy game for two players in the browser: real-tim
 turn-based campaign map. Nothing here is taken from, or affiliated with, any commercial title. The
 factions, units and rules are invented for this project.
 
+**Play it:** https://legio-online.onrender.com (free hosting: after a quiet spell the first visit can take
+about a minute while the server wakes up).
+
 ## Run it
 
 ```
@@ -77,7 +80,10 @@ Node process** and keeps WebSocket connections open. Do not use serverless funct
 land on different instances and never meet.
 
 - **Render**: `render.yaml` is a ready blueprint (free plan, health check `/healthz`). New > Blueprint,
-  pick the repository.
+  pick the repository, or open https://render.com/deploy?repo=https://github.com/eastandwesting/legio-online-game
+  for a one-click deploy of your own copy. Checked on the live service: Render passes the client-supplied
+  `X-Forwarded-For` through and appends the real client address, so the app sees `<anything>,<real client>` and
+  the default of 1 hop is correct.
 - **Anything with Docker** (Fly.io, Railway, a VPS): use the `Dockerfile`; it listens on `PORT`.
 - **Behind a proxy, set `TRUST_PROXY_HOPS`** to the number of proxies in front of the app (1 on Render, where it
   is the default; 0 = none, the default everywhere else). The per-address limits count players by their
