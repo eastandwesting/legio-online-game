@@ -140,7 +140,7 @@ Required changes:
 - **P0 Facing on arrival.** A move order with a finite `face` leaves the regiment facing that way when it
   arrives. A regiment with no order that is attacked and is not itself attacking turns to face its nearest
   attacker (flank and rear multipliers use the target's tick-start facing).
-- Keep the current feel otherwise: same unit stats, damage formula, flank (x1.35) and rear (x1.8)
+- Keep the current feel otherwise: same unit stats (as tuned in `docs/BALANCE.md`; recruit prices sword 100, spear 90, archer 125, cav 145), damage formula, flank (x1.35) and rear (x1.8)
   multipliers, charge bonus, spear anti-cavalry, 20 s rout timer, auto-acquire radius (melee 40, ranged = range).
 
 Tests (`test/sim.test.mjs`): determinism (same inputs -> identical snapshots); mirror symmetry;
@@ -609,7 +609,8 @@ Add a "Leave room" button in the room view and a small "Quit" button during batt
   with the start men taken from `start.startMen`, morale bar, greyed when routing or dead); click selects, shift-click adds, double-click selects all of
   that type; selected cards are highlighted.
 - **P1** Help overlay listing the controls and the unit match-ups (spears stop cavalry; cavalry runs down
-  archers and wins on flanks and rear; archers wear infantry down; rear attacks break morale), and stating
+  archers and wins on flanks and rear; archers wear spears down; swords are the all-rounder, good against
+  archers and cavalry and weaker than spears; rear attacks break morale), and stating
   that a battle ends at the time limit (in a campaign the defender holds unless it has lost clearly more than
   the attacker, below 0.75 of the attacker's surviving share; otherwise the side with more of its army left
   wins, and near-equal is a draw).

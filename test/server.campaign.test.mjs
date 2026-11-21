@@ -38,15 +38,15 @@ test('campaign against the AI: view contents, battles inside the turn flow, comp
   assert.deepEqual([first.turnLimit, first.endReason], [100, null], 'turnLimit is an integer, endReason is null while the campaign runs');
   assert.deepEqual([first.income, first.units, first.maxUnits, first.replenish], [40, 4, 16, 0.25]);
   assert.equal(first.gold, 400);
-  assert.equal(first.cost.cav, 200);
-  assert.equal(first.types.archer.men, 40);
+  assert.equal(first.cost.cav, 145);
+  assert.equal(first.types.archer.men, 34);
   assert.deepEqual([first.provs.length, first.owner.length, first.edges.length], [13, 13, 24]);
   assert.deepEqual(first.capital, [0, 12]);
   assert.deepEqual(first.ready, [false, true], 'the AI has given its orders');
   assert.deepEqual(first.moves, {});
   assert.equal(first.opponent, 'Rival Legate (AI)');
   assert.deepEqual(first.armies[0], { id: 1, owner: 0, prov: 0, units: [
-    { type: 'sword', men: 60 }, { type: 'sword', men: 60 }, { type: 'spear', men: 60 }, { type: 'archer', men: 40 }] });
+    { type: 'sword', men: 58 }, { type: 'sword', men: 58 }, { type: 'spear', men: 60 }, { type: 'archer', men: 34 }] });
 
   // A passive player: end every turn, give no battle orders. The AI must finish the game.
   let last = first, starts = 0, ends = 0, final = null;
@@ -112,7 +112,7 @@ test('two humans: the attacker meets a defender; on time-out the defender holds 
   const [nextA, nextB] = await Promise.all([a.next(camp('orders')), b.next(camp('orders'))]);
   assert.equal(nextA.turn, 5);
   assert.deepEqual(nextA.armies, [{ id: 2, owner: 1, prov: 7, units: [
-    { type: 'sword', men: 60 }, { type: 'sword', men: 60 }, { type: 'spear', men: 60 }, { type: 'archer', men: 40 }] }]);
+    { type: 'sword', men: 58 }, { type: 'sword', men: 58 }, { type: 'spear', men: 60 }, { type: 'archer', men: 34 }] }]);
   assert.deepEqual(nextB.armies, nextA.armies);
   assert.equal(nextA.owner[7], 1);
   assert.ok(nextA.log.includes('Battle at Ironridge: Blue victorious.'));
@@ -156,7 +156,7 @@ test('two humans: a fought battle; the survivors are regrouped into the winner\'
   }
   assert.deepEqual(await b.next('end'), end);
   const final = lastSnap(a);
-  assert.ok(final.regs.some(r => r[6] < 60 && r[2] !== 'archer'), 'there was a real fight');
+  assert.ok(final.regs.some(r => r[6] < ({ sword: 58, spear: 60, cav: 37 })[r[2]]), 'there was a real fight');
 
   const [view] = await Promise.all([a.next(camp('orders')), b.next(camp('orders'))]);
   const here = view.armies.filter(x => x.prov === 6);
@@ -240,7 +240,7 @@ test('rejoin during campaign orders keeps gold, recruits and marches; each view 
   a.send({ t: 'recruit', prov: 0, type: 'cav' });
   a.send({ t: 'cmove', army: 1, to: 2 });
   const mine = await a.next(m => m.t === 'camp' && m.moves[1] === 2);
-  assert.deepEqual([mine.gold, mine.units, mine.moves], [200, 5, { 1: 2 }]);
+  assert.deepEqual([mine.gold, mine.units, mine.moves], [255, 5, { 1: 2 }]);
   const theirs = await b.next(m => m.t === 'camp' && m.armies[0].units.length === 5);
   await b.flush();
   for (const m of b.msgs.filter(x => x.t === 'camp')) {
@@ -260,7 +260,7 @@ test('rejoin during campaign orders keeps gold, recruits and marches; each view 
   assert.deepEqual([room.t, room.phase, room.you], ['room', 'campaign', 0]);
   const view = await a2.next();
   assert.equal(view.t, 'camp');
-  assert.deepEqual([view.you, view.turn, view.phase, view.gold, view.units, view.moves], [0, 1, 'orders', 200, 5, { 1: 2 }]);
+  assert.deepEqual([view.you, view.turn, view.phase, view.gold, view.units, view.moves], [0, 1, 'orders', 255, 5, { 1: 2 }]);
   assert.deepEqual(view.ready, [false, false]);
   await a2.flush();
   assert.deepEqual(quiet(a2), [], 'no battle is running, so no start');

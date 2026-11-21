@@ -11,10 +11,10 @@ export const BATTLE_TIME_LIMIT = 300; // seconds of sim time
 
 const freeze = Object.freeze;
 export const TYPES = freeze({
-  sword:  freeze({ name: 'Shortsword Infantry', men: 60, speed: 46,  range: 16,  dps: 0.040, armor: 0.30, ranged: false }),
-  spear:  freeze({ name: 'Spear Phalanx',       men: 60, speed: 38,  range: 18,  dps: 0.030, armor: 0.35, ranged: false, antiCav: 2 }),
-  archer: freeze({ name: 'Archers',             men: 40, speed: 52,  range: 170, dps: 0.026, armor: 0.05, ranged: true, ammo: 30, meleeDps: 0.008, meleeRange: 16 }),
-  cav:    freeze({ name: 'Heavy Cavalry',       men: 24, speed: 110, range: 18,  dps: 0.070, armor: 0.20, ranged: false, charge: 1.8 }),
+  sword:  freeze({ name: 'Shortsword Infantry', men: 58, speed: 46,  range: 16,  dps: 0.038, armor: 0.30, ranged: false }),
+  spear:  freeze({ name: 'Spear Phalanx',       men: 60, speed: 38,  range: 18,  dps: 0.031, armor: 0.29, ranged: false, antiCav: 1.75 }),
+  archer: freeze({ name: 'Archers',             men: 34, speed: 52,  range: 170, dps: 0.028, armor: 0.09, ranged: true, ammo: 32, meleeDps: 0.008, meleeRange: 16 }),
+  cav:    freeze({ name: 'Heavy Cavalry',       men: 37, speed: 110, range: 18,  dps: 0.0836, armor: 0.22, ranged: false, charge: 2 }),
 });
 
 // Both sides of a quick battle field the same army.

@@ -165,7 +165,7 @@ test('start carries startMen: every regiment of both sides with its men at the s
     assert.ok(Number.isInteger(startA.startMen[String(r[0])]) && startA.startMen[String(r[0])] >= 1);
     assert.equal(startA.startMen[String(r[0])], r[6], `regiment ${r[0]}: men at the start`);
   }
-  assert.deepEqual(Object.values(startA.startMen).slice(0, 9), [60, 60, 60, 60, 60, 40, 40, 24, 24]);
+  assert.deepEqual(Object.values(startA.startMen).slice(0, 9), [58, 58, 58, 60, 60, 34, 34, 37, 37]);
 
   // fight until somebody is clearly hurt, then reload: the denominators must not move
   let hurt = null;
@@ -194,5 +194,5 @@ test('start carries startMen of a campaign battle: units that came in below full
   room.camp.armies.find(x => x.id === 2).units[3].men = 17;     // Blue's archers too
   const [startA, startB] = await Promise.all([a.next('start'), b.next('start')]);
   assert.deepEqual(startA.startMen, startB.startMen);
-  assert.deepEqual(startA.startMen, { 1: 33, 2: 60, 3: 60, 4: 40, 5: 60, 6: 60, 7: 60, 8: 17 });
+  assert.deepEqual(startA.startMen, { 1: 33, 2: 58, 3: 60, 4: 34, 5: 58, 6: 58, 7: 60, 8: 17 });
 });

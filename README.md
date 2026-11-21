@@ -38,8 +38,9 @@ Needs Node 20 or newer. The only dependency is `ws`.
 
 ### Battle rules
 
-- Units: shortsword infantry, spear phalanx (stops cavalry), archers (limited arrows), heavy cavalry
-  (charge bonus; runs down archers).
+- Units: shortsword infantry, spear phalanx (stops cavalry), archers (limited arrows; wear down spears), heavy
+  cavalry (charge bonus; runs down archers). Swords are the all-rounder. Prices: sword 100, spear 90, archer 125,
+  cavalry 145 gold. Measured match-ups and the tuning method are in [docs/BALANCE.md](docs/BALANCE.md).
 - Hits from the flank hurt more, hits from behind most of all, and they break morale. A regiment that
   loses its nerve routs and leaves the field.
 - Both sides are resolved at the same instant each tick, so neither side has an edge from ordering.

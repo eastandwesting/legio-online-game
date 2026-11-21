@@ -23,7 +23,7 @@ export const EDGES = [[0,1],[0,2],[0,3],[1,2],[2,3],[1,4],[2,4],[2,5],[3,5],[4,6
 export const ADJ = PROVS.map(() => []);
 for (const [a, b] of EDGES) { ADJ[a].push(b); ADJ[b].push(a); }
 
-export const COST = { sword: 100, spear: 110, archer: 120, cav: 200 };
+export const COST = { sword: 100, spear: 90, archer: 125, cav: 145 };
 export const START_GOLD = 400, INCOME = 40, MAX_UNITS = 16;
 // The campaign ends after this many turns (endTurn at the limit): the player with more provinces wins,
 // equal counts are a draw. Without it two evenly matched players (or two AIs) could trade drawn battles for ever.

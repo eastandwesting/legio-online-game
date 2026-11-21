@@ -345,11 +345,11 @@ test('resolveMoves: ignores orders that are not a real adjacent step, never thro
 
 // ---------- regroup ----------
 test('regroup: pools men per type into full units plus at most one remainder', () => {
-  const out = C.regroup([unit('cav', 5), unit('sword', 50), unit('archer', 40), unit('sword', 45), unit('spear', 1),
-    unit('sword', 30), unit('cav', 20)]);
+  const out = C.regroup([unit('cav', 5), unit('sword', 50), unit('archer'), unit('sword', 45), unit('spear', 1),
+    unit('sword', 30), unit('cav', 33)]);
   assert.deepEqual(out, [
-    { type: 'sword', men: 60 }, { type: 'sword', men: 60 }, { type: 'sword', men: 5 },
-    { type: 'spear', men: 1 }, { type: 'archer', men: 40 }, { type: 'cav', men: 24 }, { type: 'cav', men: 1 },
+    { type: 'sword', men: 58 }, { type: 'sword', men: 58 }, { type: 'sword', men: 9 },
+    { type: 'spear', men: 1 }, { type: 'archer', men: 34 }, { type: 'cav', men: 37 }, { type: 'cav', men: 1 },
   ]);
   assert.deepEqual(C.regroup([]), []);
   assert.deepEqual(C.regroup(units('sword', 3)), units('sword', 3));
@@ -406,7 +406,7 @@ test('applyBattle: loser removed, winner keeps regrouped survivors', () => {
   const survivors = [[unit('sword', 20), unit('sword', 50), unit('sword', 1)], [unit('spear', 30)]];
   assert.equal(C.applyBattle(c, b, 0, survivors), true);
   assert.equal(armyOf(c, 2), undefined, 'loser gone even though some of its men lived');
-  assert.deepEqual(armyOf(c, 1).units, [{ type: 'sword', men: 60 }, { type: 'sword', men: 11 }]);
+  assert.deepEqual(armyOf(c, 1).units, [{ type: 'sword', men: 58 }, { type: 'sword', men: 13 }]);
   assert.notEqual(armyOf(c, 1).units, survivors[0], 'the caller\'s array is not kept');
   assert.equal(armyOf(c, 1).prov, 10);
   assert.equal(c.armies.length, 2, 'the uninvolved army is untouched');
@@ -534,11 +534,11 @@ test('endTurn: income per owned province, turn counter, ready reset, log trimmed
 
 test('endTurn: replenishment only on own soil, capped at full strength', () => {
   const worn = () => [unit('sword', 10), unit('sword', 55), unit('spear', 60), unit('archer', 1), unit('cav', 17),
-    unit('cav', 24)];
+    unit('cav')];
   const c = setup([[0, 2, worn()], [0, 6, worn()], [0, 10, worn()], [1, 11, worn()], [1, 3, worn()]]);
   assert.equal(C.endTurn(c), true);
-  const healed = [unit('sword', 25), unit('sword', 60), unit('spear', 60), unit('archer', 11), unit('cav', 23),
-    unit('cav', 24)];
+  const healed = [unit('sword', 25), unit('sword', 58), unit('spear', 60), unit('archer', 10), unit('cav', 27),
+    unit('cav')];
   assert.deepEqual(armyOf(c, 1).units, healed, 'red in red Midvale');
   assert.deepEqual(armyOf(c, 2).units, worn(), 'red in neutral Heartland');
   assert.deepEqual(armyOf(c, 3).units, worn(), 'red in blue Dunemouth');
@@ -661,19 +661,19 @@ test('AI: the garrison holds for at most 2 turns in a row while a stronger enemy
 test('AI: the garrison attacks at once with 70% of the men near the capital, the nearest enemy first', () => {
   const near = men => {      // an enemy of exactly `men` men at Highwold, two steps from the capital
     const foe = units('sword', 4);
-    foe.push(unit('archer', men - 240));
-    return setup([[0, 0, units('sword', 3)], [1, 4, foe]]);   // the garrison has 180 men
+    foe.push(unit('archer', men - 232));
+    return setup([[0, 0, units('sword', 3)], [1, 4, foe]]);   // the garrison has 174 men
   };
-  let c = near(257);         // 0.7 * 257 = 179.9
+  let c = near(248);         // 0.7 * 248 = 173.6
   aiOrders(c, 0);
   assert.ok([1, 2].includes(aiMove(c, 0, 1)), 'strong enough: attacks at once, an enemy two steps away included');
-  c = near(258);             // 0.7 * 258 = 180.6
+  c = near(249);             // 0.7 * 249 = 174.3
   aiOrders(c, 0);
   assert.equal(aiMove(c, 0, 1), null, 'one man short: holds');
   // everything near the capital counts, not only the army that is attacked
   const d = setup([[0, 0, units('sword', 3)], [1, 2, units('sword', 1)], [1, 4, units('sword', 5)]]);
   aiOrders(d, 0);
-  assert.equal(aiMove(d, 0, 1), null, '180 against 60 + 300');
+  assert.equal(aiMove(d, 0, 1), null, '174 against 58 + 290');
   // the nearest enemy army is the target: the small one next door, not the big one behind it
   const e = setup([[0, 0, units('sword', 8)], [1, 2, units('sword', 2)], [1, 4, units('sword', 5)]]);
   aiOrders(e, 0);

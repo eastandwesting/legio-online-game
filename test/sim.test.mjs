@@ -152,8 +152,8 @@ test('createBattle validates units', () => {
   ];
   const b = createBattle([junk, []]);
   assert.deepEqual(side(b, 0).map(r => [r.type, r.men]), [
-    ['sword', 30], ['archer', 1], ['archer', 1], ['cav', 24], ['spear', 12],
-    ['spear', 60], ['spear', 60], ['sword', 60], ['cav', 24],
+    ['sword', 30], ['archer', 1], ['archer', 1], ['cav', 37], ['spear', 12],
+    ['spear', 60], ['spear', 60], ['sword', 58], ['cav', 37],
   ]);
   for (const r of b.regs) {
     assert.ok(Number.isInteger(r.men) && r.men >= 1 && r.men <= TYPES[r.type].men);
@@ -661,7 +661,7 @@ test('morale loss is normalised by the starting strength', () => {
     return { men: startMen - c.men, morale: 100 - c.morale };
   };
   const big = lossAfterOneTick(60), small = lossAfterOneTick(30);
-  const dmg = 60 * 0.040 * (1 - 0.30) * TICK * 10;            // front attack by 60 swordsmen
+  const dmg = 58 * 0.038 * (1 - 0.30) * TICK * 10;            // front attack by 60 swordsmen
   assert.ok(near(big.men, dmg) && near(small.men, dmg));
   assert.ok(near(big.morale, dmg * 0.6 * (60 / 60) * 0.6));
   assert.ok(near(small.morale, dmg * 0.6 * (60 / 30) * 0.6), 'the same casualties hurt a half-size unit twice as much');
@@ -691,25 +691,25 @@ test('damage formula: front, flank, rear, charge and spear wall', () => {
     step(b);
     return { men: c.startMen - c.men, morale: 100 - c.morale, a, c, b };
   };
-  const base = 60 * 0.040 * (1 - 0.30) * TICK * 10;
+  const base = 58 * 0.038 * (1 - 0.30) * TICK * 10;
   const front = firstHit('sword', 'sword', Math.PI);
   assert.ok(near(front.men, base));
   const flank = firstHit('sword', 'sword', Math.PI / 2);
   assert.ok(near(flank.men, base * 1.35));
-  assert.ok(near(flank.morale, base * 1.35 * 0.6 * 0.6));
+  assert.ok(near(flank.morale, base * 1.35 * 0.6 * (60 / TYPES.sword.men) * 0.6));
   const rear = firstHit('sword', 'sword', 0);
   assert.ok(near(rear.men, base * 1.8));
-  assert.ok(near(rear.morale, base * 1.8 * 1.4 * 0.6), 'rear attacks break morale');
+  assert.ok(near(rear.morale, base * 1.8 * 1.4 * (60 / TYPES.sword.men) * 0.6), 'rear attacks break morale');
 
   const charge = firstHit('cav', 'sword', Math.PI);
-  assert.ok(near(charge.men, 24 * 0.070 * 1.8 * (1 - 0.30) * TICK * 10));
+  assert.ok(near(charge.men, 37 * 0.0836 * 2 * (1 - 0.30) * TICK * 10));
   const wall = firstHit('cav', 'spear', Math.PI);
-  assert.ok(near(wall.men, 24 * 0.070 * 1.8 / 2 * (1 - 0.35) * TICK * 10), 'spears halve cavalry damage');
+  assert.ok(near(wall.men, 37 * 0.0836 * 2 / 1.75 * (1 - 0.29) * TICK * 10), 'spears halve cavalry damage');
 
   // Archers get no flank bonus on damage, and shooting uses ammo.
   const shot = firstHit('archer', 'sword', 0);
-  assert.ok(near(shot.men, 40 * 0.026 * (1 - 0.30) * TICK * 10));
-  assert.ok(near(shot.a.ammo, 30 - TICK));
+  assert.ok(near(shot.men, 34 * 0.028 * (1 - 0.30) * TICK * 10));
+  assert.ok(near(shot.a.ammo, 32 - TICK));
 });
 
 test('the cavalry charge bonus lasts one second of continuous melee', () => {
@@ -723,8 +723,8 @@ test('the cavalry charge bonus lasts one second of continuous melee', () => {
     step(b);
     perTick.push((before - c.men) / attackers);
   }
-  const plain = 0.070 / 2 * (1 - 0.35) * TICK * 10;
-  for (let i = 0; i < 20; i++) assert.ok(near(perTick[i], plain * 1.8), `tick ${i} is a charge`);
+  const plain = 0.0836 / 1.75 * (1 - 0.29) * TICK * 10;
+  for (let i = 0; i < 20; i++) assert.ok(near(perTick[i], plain * 2), `tick ${i} is a charge`);
   for (let i = 20; i < 30; i++) assert.ok(near(perTick[i], plain), `tick ${i} is ordinary melee`);
 });
 
@@ -734,7 +734,7 @@ test('archers without ammo cannot hurt anything beyond melee range', () => {
   idle.a.ammo = 0;
   place(idle.a, 700, 450, 0); place(idle.c, 800, 450, Math.PI);
   for (let i = 0; i < 100; i++) step(idle.b);
-  assert.equal(idle.c.men, 60);
+  assert.equal(idle.c.men, 58);
   assert.equal(idle.a.x, 700, 'it does not wander off after distant enemies either');
 
   // Ordered to attack, it must walk into contact first.
@@ -748,7 +748,7 @@ test('archers without ammo cannot hurt anything beyond melee range', () => {
     const before = c.men, d = gap(a, c);
     step(b);
     if (c.men < before) firstHitAt = d;
-    else assert.ok(c.men === 60);
+    else assert.ok(c.men === 58);
   }
   assert.ok(firstHitAt !== null, 'it does fight once in contact');
   assert.ok(firstHitAt <= TYPES.archer.meleeRange + 12 + 1e-9, `first melee hit landed from ${firstHitAt}`);
@@ -757,16 +757,16 @@ test('archers without ammo cannot hurt anything beyond melee range', () => {
   const shooting = duel('archer', 'sword');
   place(shooting.a, 640, 450, 0); place(shooting.c, 800, 450, Math.PI);
   step(shooting.b);
-  assert.ok(shooting.c.men < 60);
+  assert.ok(shooting.c.men < 58);
   const dry = duel('archer', 'sword');
   dry.a.ammo = 0;
   place(dry.a, 780, 450, 0); place(dry.c, 800, 450, Math.PI);
   giveOrder(dry.b, 1, [dry.c.id], { t: 'move', x: 1500, y: 450 });
   step(dry.b);
-  assert.ok(near(60 - dry.c.men, 40 * 0.008 * (1 - 0.30) * TICK * 10));
+  assert.ok(near(58 - dry.c.men, 34 * 0.008 * (1 - 0.30) * TICK * 10));
 });
 
-test('archers run out of arrows after 30 s of shooting', () => {
+test('archers run out of arrows after 32 s of shooting', () => {
   const { b, a, c } = duel('archer', 'spear');
   place(a, 300, 450, 0); place(c, 460, 450, Math.PI);
   giveOrder(b, 1, [c.id], { t: 'move', x: 461, y: 450 });
@@ -778,7 +778,7 @@ test('archers run out of arrows after 30 s of shooting', () => {
     step(b);
     if (a.ammo < before) shots++;
   }
-  assert.ok(shots >= 600 && shots <= 601, `${shots} ticks of shooting`);
+  assert.ok(shots >= 640 && shots <= 641, `${shots} ticks of shooting`);
   assert.equal(a.ammo, 0);
   assert.equal(snapshot(b).regs[0][9], 0);
 });
@@ -806,9 +806,9 @@ test('an idle regiment under fire turns to its nearest attacker; the first volle
   place(s, 800, 450, Math.PI);                                // looking the wrong way
   place(far, 800, 300, 0); place(nearby, 800, 570, 0);
   step(b);
-  const volley = 40 * 0.026 * (1 - 0.30) * TICK * 10;
+  const volley = 34 * 0.028 * (1 - 0.30) * TICK * 10;
   // Tick-start facing was west: both archers shoot it in the flank, not the rear, so morale takes x0.6.
-  assert.ok(near(100 - s.morale, 2 * volley * 0.6 * 0.6));
+  assert.ok(near(100 - s.morale, 2 * volley * 0.6 * (60 / TYPES.sword.men) * 0.6));
   assert.ok(near(s.face, Math.PI / 2), 'faces the nearer archers (below it)');
   assert.equal(s.state, 'idle');
 
@@ -825,7 +825,7 @@ test('an idle regiment under fire turns to its nearest attacker; the first volle
   const [u] = side(r, 0), [sh] = side(r, 1);
   place(u, 800, 450, Math.PI); place(sh, 900, 450, Math.PI);
   step(r);
-  assert.ok(near(100 - u.morale, volley * 1.4 * 0.6));
+  assert.ok(near(100 - u.morale, volley * 1.4 * (60 / TYPES.sword.men) * 0.6));
   assert.ok(near(u.face, 0), 'and then it turns round');
 });
 
@@ -837,7 +837,7 @@ test('idle melee troops pick up enemies within 40; marching troops ignore them',
   assert.equal(c.men, 60);
   place(c, 739, 450);
   for (let i = 0; i < 40; i++) step(b);
-  assert.ok(c.men < 60 && a.men < 60, 'inside 40 both sides join battle');
+  assert.ok(c.men < 60 && a.men < 58, 'inside 40 both sides join battle');
 
   const m = duel('sword', 'spear');
   place(m.a, 700, 450); place(m.c, 730, 470);
@@ -871,14 +871,14 @@ test('routing regiments flee to their own edge and are gone within 20 s', () => 
     const b = createBattle([full('sword', 2), full('sword', 2)]);
     const r = side(b, owner)[0];
     place(r, 800, 450);
-    r.men = 8;                                                // under 15% of the 60 it started with
+    r.men = 8;                                                // under 15% of the 58 it started with
     step(b);
     assert.equal(r.state, 'rout');
     assert.equal(r.order, null);
     const x0 = r.x;
     for (let i = 0; i < 20; i++) step(b);
     assert.ok(owner === 0 ? r.x < x0 - 50 : r.x > x0 + 50, 'runs toward its own side');
-    assert.deepEqual(battleSurvivors(b, owner).map(u => u.men), [4, 60], 'a router keeps half its men');
+    assert.deepEqual(battleSurvivors(b, owner).map(u => u.men), [4, 58], 'a router keeps half its men');
     for (let i = 0; i < 400; i++) step(b);
     assert.equal(r.state, 'dead');
     assert.equal(battleSurvivors(b, owner).length, 1, 'once gone it is lost');
@@ -923,5 +923,5 @@ test('battleSurvivors: whole men, at least 1, routers keep half, the dead are le
   a3.men = 0.7; a3.state = 'rout';
   a4.state = 'dead';
   assert.deepEqual(battleSurvivors(b, 0), [{ type: 'sword', men: 42 }, { type: 'sword', men: 21 }, { type: 'sword', men: 1 }]);
-  assert.deepEqual(battleSurvivors(b, 1), [{ type: 'archer', men: 40 }]);
+  assert.deepEqual(battleSurvivors(b, 1), [{ type: 'archer', men: 34 }]);
 });
