@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/bots.js"
+    "test": "node test/run.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
