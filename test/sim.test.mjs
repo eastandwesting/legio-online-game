@@ -545,12 +545,34 @@ test('custom time limits count sim seconds', () => {
   assert.ok(near(odd.time, 0.75), 'ends on the first tick at or past the limit');
 });
 
-test('timeout winner: the defender holds', () => {
-  for (const defender of [0, 1]) {
+test('timeout winner with a defender: it holds unless its surviving share is below 0.75 of the attackers share', () => {
+  // Shares are live men / start men per side (3 swords of 60 each); only the defender is damaged here.
+  const timed = (defender, share, prepare = () => {}) => {
     const b = createBattle([full('sword', 3), full('sword', 3)], { timeLimit: 0.5, defender });
-    for (const r of side(b, defender)) r.men = r.startMen * 0.5;      // the defender is clearly weaker
-    run(b);
-    assert.equal(b.reason, 'timeout');
+    for (const r of side(b, defender)) r.men = r.startMen * share;
+    prepare(side(b, defender), side(b, 1 - defender));
+    return run(b);
+  };
+  for (const defender of [0, 1]) {
+    const attacker = 1 - defender;
+    let b = timed(defender, 1);
+    assert.deepEqual([b.reason, b.winner], ['timeout', defender], 'equal shares: the defender holds');
+    assert.equal(timed(defender, 0.76).winner, defender, '0.76 of the attackers 1.0: holds');
+    assert.equal(timed(defender, 0.74).winner, attacker, '0.74: the attacker wins');
+    assert.equal(timed(defender, 0.5).winner, attacker, 'clearly weaker: the attacker wins');
+    // a damaged attacker lowers the bar: 0.5 of 0.6 is 0.83
+    b = timed(defender, 0.5, (d, a) => { for (const r of a) r.men = r.startMen * 0.6; });
+    assert.equal(b.winner, defender);
+    // routing regiments count at half weight on both sides: (60 + 60 + 30) / 180 = 0.83 against a 1.0 attacker
+    b = timed(defender, 1, d => { d[2].state = 'rout'; });
+    assert.equal(b.winner, defender, 'one routing regiment of three is only half a loss');
+    b = timed(defender, 1, d => { d[1].state = 'rout'; d[2].state = 'rout'; });   // (60 + 30 + 30) / 180 = 0.67
+    assert.equal(b.winner, attacker);
+    b = timed(defender, 1, (d, a) => { d[1].state = 'rout'; d[2].state = 'rout'; a[2].state = 'rout'; });   // 0.67 against 0.83
+    assert.equal(b.winner, defender, '0.67 is not below 0.75 * 0.83 = 0.625');
+    b = timed(defender, 0.6, (d, a) => { a[2].state = 'rout'; });   // 0.6 against 0.83
+    assert.equal(b.winner, attacker, '0.6 is below 0.625');
+    b = timed(defender, 1, (d, a) => { d[2].state = 'rout'; a[1].state = 'rout'; a[2].state = 'rout'; });   // 0.83 against 0.67
     assert.equal(b.winner, defender);
   }
 });
@@ -573,8 +595,12 @@ test('timeout winner without a defender: larger surviving share, or a draw withi
   b = timed((s0, s1) => { s0[0].men = 57; s1[0].men = 55; }); // 0.975 vs 0.979
   assert.equal(b.winner, -1);
 
-  // Routing regiments count as lost, whatever men they still have.
-  b = timed((s0, s1) => { s1[0].state = 'rout'; s1[1].state = 'rout'; });   // 1.0 vs 0.5
+  // Routing regiments count at half weight: one of four routing is 0.875, not 1.0 and not 0.75.
+  b = timed((s0, s1) => { s0[0].men = 36; s1[0].state = 'rout'; });   // 0.8 vs 0.875
+  assert.equal(b.winner, 1);
+  b = timed((s0, s1) => { s0[0].men = 54; s1[0].state = 'rout'; });   // 0.95 vs 0.875
+  assert.equal(b.winner, 0);
+  b = timed((s0, s1) => { s1[0].state = 'rout'; s1[1].state = 'rout'; });   // 1.0 vs 0.75
   assert.equal(b.winner, 0);
 
   // Shares are measured against the strength at the start of the battle, not full strength.
@@ -639,6 +665,22 @@ test('morale loss is normalised by the starting strength', () => {
   assert.ok(near(big.men, dmg) && near(small.men, dmg));
   assert.ok(near(big.morale, dmg * 0.6 * (60 / 60) * 0.6));
   assert.ok(near(small.morale, dmg * 0.6 * (60 / 30) * 0.6), 'the same casualties hurt a half-size unit twice as much');
+});
+
+test('morale recovers at 1.5 per second for a regiment that took no damage, up to 100', () => {
+  const { b, a } = duel('sword', 'sword');
+  place(a, 200, 450); place(b.regs[1], 1400, 450);
+  a.morale = 50;
+  for (let i = 0; i < 40; i++) step(b);                       // 2 s, nobody anywhere near
+  assert.ok(near(a.morale, 50 + 2 * 1.5, 1e-6), `morale ${a.morale}`);
+  a.morale = 99.95;
+  step(b);
+  assert.equal(a.morale, 100);
+  a.morale = 50;
+  const foe = b.regs[1];
+  place(foe, a.x + 15, a.y);                                   // in contact: it takes damage, so no recovery
+  step(b);
+  assert.ok(a.morale < 50);
 });
 
 test('damage formula: front, flank, rear, charge and spear wall', () => {

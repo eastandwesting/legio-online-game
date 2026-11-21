@@ -101,7 +101,7 @@ test('importing server.js starts nothing', async () => {
 async function withFreePort(start) {
   let result;
   for (let attempt = 0; attempt < 4; attempt++) {
-    const port = 4520 + ((process.pid + attempt * 7) % 40);
+    const port = 4800 + ((process.pid + attempt * 7) % 50);
     result = { port, ...(await start(port)) };
     if (!/EADDRINUSE/.test(result.run.stderr)) break;
   }
@@ -177,7 +177,7 @@ test('SIGTERM handler: clients are told about the restart and the process exits 
 // followed by `body`, which may use `c` (a connected client), `connect` and `wsUrl`.
 // The child ends by emitting SIGTERM to itself.
 const mainScript = (port, env, body) => `
-  Object.assign(process.env, ${JSON.stringify({ RENDER: '', TRUST_PROXY: '', ...env, PORT: String(port) })});
+  Object.assign(process.env, ${JSON.stringify({ RENDER: '', TRUST_PROXY_HOPS: '', MAX_ROOMS: '', MAX_CONNECTIONS: '', MAX_PER_IP: '', ...env, PORT: String(port) })});
   process.argv[1] = ${JSON.stringify(path.join(ROOT, 'server.js'))};
   await import(${url('server.js')});
   const { connect } = await import(${url('test/harness.mjs')});
@@ -212,14 +212,14 @@ test('run directly: an uncaught exception and an unhandled rejection are logged 
   assert.match(run.stderr, /unhandled rejection[^]*boom-rejected/);
 });
 
-test('run directly: on Render the first X-Forwarded-For hop is the client; TRUST_PROXY overrides that', async () => {
-  // 21 connections, each claiming another client address in front of one shared last hop.
-  // The default limit is 20 per address, so the number accepted shows which address was believed.
+test('run directly: TRUST_PROXY_HOPS counts proxies from the right (1 on Render, off elsewhere); MAX_PER_IP is the limit', async () => {
+  // 41 connections, each claiming another client address in front of two shared proxy-added entries.
+  // The number accepted shows which entry was believed: the same address for all (limit applies), or a different one each.
   const body = `
     await c.close();
     await wait(100);
     const all = [];
-    for (let i = 1; i <= 21; i++) all.push(await connect(wsUrl, { headers: { 'X-Forwarded-For': '203.0.113.' + i + ', 198.51.100.7' } }));
+    for (let i = 1; i <= 41; i++) all.push(await connect(wsUrl, { headers: { 'X-Forwarded-For': '192.0.2.' + i + ', 203.0.113.' + i + ', 198.51.100.7' } }));
     let accepted = 0;
     for (const x of all) {
       try { x.send({ t: 'ping' }); } catch { /* already closed */ }
@@ -232,9 +232,28 @@ test('run directly: on Render the first X-Forwarded-For hop is the client; TRUST
     assert.equal(run.code, 0, `${JSON.stringify(env)} stderr: ${run.stderr}`);
     return Number((/accepted (\d+)/.exec(run.stdout) || [])[1]);
   };
-  assert.equal(await accepted({}), 20, 'not behind a proxy: the header is ignored, all share the socket address');
-  assert.equal(await accepted({ RENDER: 'true' }), 21, 'on Render: the first hop');
-  assert.equal(await accepted({ RENDER: 'true', TRUST_PROXY: 'false' }), 20, 'switched off');
-  assert.equal(await accepted({ TRUST_PROXY: '1' }), 20, 'one trusted proxy: the last hop, which a client cannot forge');
-  assert.equal(await accepted({ TRUST_PROXY: '2' }), 21, 'two trusted proxies: the hop before the last');
+  assert.equal(await accepted({}), 20, 'not behind a proxy: the header is ignored, all share the socket address (20 per address)');
+  assert.equal(await accepted({ RENDER: 'true' }), 40, 'on Render: one trusted hop, the last entry is shared (40 per address behind a proxy)');
+  assert.equal(await accepted({ RENDER: 'true', TRUST_PROXY_HOPS: '0' }), 20, 'switched off');
+  assert.equal(await accepted({ TRUST_PROXY_HOPS: '1' }), 40, 'one proxy of our own: the last entry, which a client cannot forge');
+  assert.equal(await accepted({ TRUST_PROXY_HOPS: '2' }), 41, 'two proxies: the entry before the last tells the clients apart');
+  assert.equal(await accepted({ TRUST_PROXY_HOPS: '1', MAX_PER_IP: '7' }), 7, 'MAX_PER_IP');
+  assert.equal(await accepted({ TRUST_PROXY_HOPS: 'banana', MAX_PER_IP: '-4' }), 20, 'invalid values are ignored');
+});
+
+test('run directly: if close() never finishes, the hard 3 s deadline still ends the process (exit 0)', async () => {
+  // http.Server#close never calls back here, so game.close() hangs for ever
+  const script = port => `
+    import http from 'node:http';
+    http.Server.prototype.close = function () { return this; };
+    Object.assign(process.env, ${JSON.stringify({ RENDER: '', PORT: String(port) })});
+    process.argv[1] = ${JSON.stringify(path.join(ROOT, 'server.js'))};
+    await import(${url('server.js')});
+    await new Promise(r => setTimeout(r, 300));
+    process.emit('SIGTERM');
+  `;
+  const { run } = await withFreePort(async p => ({ run: await runNode(['--input-type=module', '-e', script(p)], { limitMs: 12000 }) }));
+  assert.equal(run.timedOut, false, `the process hung; stderr: ${run.stderr}`);
+  assert.equal(run.code, 0, run.stderr);
+  assert.ok(run.ms >= 2900 && run.ms < 6000, `ended after ${run.ms} ms: by the 3 s deadline`);
 });

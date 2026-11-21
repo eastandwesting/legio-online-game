@@ -75,12 +75,21 @@ export function recruit(c, p, prov, type) {
 }
 
 // Order an army to march to an adjacent province; to === null cancels the march.
+// Returns true only when the pending marches actually changed. false means the order was refused
+// (nothing changed) or it was a no-op (cancelling a march that does not exist, repeating the same
+// destination): the server uses this to stay quiet instead of re-sending the campaign view.
 export function setMove(c, p, armyId, to) {
   if (!isCamp(c) || c.winner !== null || !isSide(p) || !Number.isInteger(armyId)) return false;
   const a = c.armies.find(x => x.id === armyId && x.owner === p);
   if (!a || !c.moves[p] || typeof c.moves[p] !== 'object') return false;
-  if (to === null) { delete c.moves[p][armyId]; return true; }
+  const pending = Object.hasOwn(c.moves[p], armyId);
+  if (to === null) {
+    if (!pending) return false;
+    delete c.moves[p][armyId];
+    return true;
+  }
   if (!isProv(to) || !isProv(a.prov) || !ADJ[a.prov].includes(to)) return false;
+  if (pending && c.moves[p][armyId] === to) return false;
   c.moves[p][armyId] = to;
   return true;
 }
@@ -237,13 +246,41 @@ function route(from, goal, open) {
 // Largest army first: units, then men, then the older army. A total order keeps the AI deterministic.
 const bigger = (x, y) => y.units.length - x.units.length || menOf(y) - menOf(x) || x.id - y.id;
 
-// Garrison of a threatened capital: hold, unless an adjacent enemy can be crushed (1.5x the men of
-// everything threatening the capital). Returns the province to attack or null.
+// A garrison whose capital has enemy armies within 2 steps may hold for at most HOLD_TURNS turns in a row;
+// after that it attacks the nearest of them whatever the odds. It also attacks at once when it has at
+// least SORTIE_SHARE of the men of everything near the capital. An attack puts the AI "on the press" for
+// PRESS_TURNS turns: its armies next to an enemy army keep attacking instead of walking home again, so
+// the sortie cannot turn into a four-turn shuffle (out, back, hold, hold) that never meets the enemy.
+const HOLD_TURNS = 2;
+const SORTIE_SHARE = 0.7;
+const PRESS_TURNS = 3;
+
+// Consecutive turns player p's garrison held before this one. State lives in the campaign
+// (c.hold[p] = {turn, before, holding}) and is keyed by the turn, so asking twice in a turn gives the same answer.
+function holdsBefore(c, p) {
+  const h = Array.isArray(c.hold) ? c.hold[p] : null;
+  if (!h || typeof h !== 'object') return 0;
+  if (h.turn === c.turn) return h.before;
+  return h.turn === c.turn - 1 && h.holding ? h.before + 1 : 0;
+}
+// c.press[p] = {from, until}: on the press for the turns after `from` up to and including `until`.
+const pressing = (c, p) => {
+  const r = Array.isArray(c.press) ? c.press[p] : null;
+  return !!r && typeof r === 'object' && r.from < c.turn && c.turn <= r.until;
+};
+
+// Nearest enemy army of those near the capital (ties: the bigger one).
+const nearestThreat = ctx => [...ctx.threats].sort((x, y) => DIST[ctx.cap][x.prov] - DIST[ctx.cap][y.prov] || bigger(x, y))[0];
+
+// The garrison's order: the first step toward the nearest threat, or null to hold (ctx.holding is then set).
 function sortie(ctx, men) {
-  const adjacent = ctx.threats.filter(f => DIST[ctx.cap][f.prov] === 1);
   const total = ctx.threats.reduce((s, f) => s + menOf(f), 0);
-  if (!adjacent.length || men < 1.5 * total) return null;
-  return adjacent.sort(bigger)[0].prov;
+  if (men < SORTIE_SHARE * total && ctx.before < HOLD_TURNS) { ctx.holding = true; return null; }
+  const target = nearestThreat(ctx);
+  const way = route(ctx.cap, x => x === target.prov, () => true);
+  if (!way) { ctx.holding = true; return null; }
+  ctx.attacked = true;
+  return way.step;
 }
 
 // Where a roaming army goes: {step, dist} or null to stand still.
@@ -269,12 +306,21 @@ function aiStep(ctx, a) {
   // never walk into a stronger enemy army, unless this is a host of 12+ units
   const open = prov => n >= 12 || foeMen(prov) <= men;
   let step;
+  const next = ctx.press && a.prov !== ctx.cap && foes.filter(f => DIST[a.prov][f.prov] === 1).sort(bigger)[0];
   if (a.prov === ctx.cap && ctx.threats.length) step = sortie(ctx, men);
+  else if (next) step = next.prov;   // on the press, next to an enemy army: attack it
   else { const goal = fieldGoal(ctx, a, open, foeMen); step = goal ? goal.step : null; }
-  // Two armies that turned each other back last turn would do so forever (AI against AI):
-  // on alternate turns one side waits instead of attacking again.
-  if (step !== null && foeMen(step) > 0 && ctx.bounced.has(a.id) && (c.turn + p) % 2 === 1) return null;
+  // Two armies that turned each other back last turn would do so for ever when both attack again (AI
+  // against AI), and a single defender could keep an assault off its capital by marching out on exactly
+  // the turns it expects one. So an army that was just turned back waits or attacks again by a fixed
+  // but opaque rule: a hash of the turn, the army and the AI's own gold (which the opponent is not told).
+  if (step !== null && foeMen(step) > 0 && ctx.bounced.has(a.id) && waitsAfterBounce(c, p, a)) return null;
   return step;
+}
+
+function waitsAfterBounce(c, p, a) {
+  const h = Math.imul(c.turn * 31 + a.id, 2654435761) ^ c.gold[p];
+  return ((h >>> 15) & 1) === 1;
 }
 
 function aiOrders(c, p) {
@@ -290,9 +336,17 @@ function aiOrders(c, p) {
     threats: foes.filter(f => DIST[cap][f.prov] <= 2),
     rally: [...mine].sort(bigger)[0] || null,
     bounced: new Set(Array.isArray(c.bounced) ? c.bounced : []),
+    before: holdsBefore(c, p), press: pressing(c, p), holding: false, attacked: false,
   };
   // a null step also cancels any earlier order, so calling aiTurn twice in a turn is harmless
   for (const a of mine) setMove(c, p, a.id, aiStep(ctx, a));
+  if (!Array.isArray(c.hold)) c.hold = [null, null];
+  if (!Array.isArray(c.press)) c.press = [null, null];
+  c.hold[p] = { turn: c.turn, before: ctx.before, holding: ctx.holding };
+  if (ctx.attacked) {
+    const r = c.press[p];
+    c.press[p] = ctx.press && r ? { from: r.from, until: Math.max(r.until, c.turn + PRESS_TURNS) } : { from: c.turn, until: c.turn + PRESS_TURNS };
+  }
 }
 
 // Campaign AI for player p: recruit at the capital, then give every army its march for this turn.

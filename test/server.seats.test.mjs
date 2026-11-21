@@ -1,6 +1,6 @@
 // Seats, tokens, grace, rejoin and pause (SPEC 7.3), plus heartbeat and idle-room expiry.
 import assert from 'node:assert/strict';
-import { test, startTestServer, connect, pair, readyBoth, sleep } from './harness.mjs';
+import { test, startTestServer, connect, pair, readyBoth, sleep, attackNearest } from './harness.mjs';
 
 async function server(t, options) {
   const logs = [];
@@ -195,6 +195,8 @@ test('reload in the lobby and after a game: the seat survives, ready is reset', 
   const a3 = await rejoin(s, code, roomA.token);
   const over = await a3.next('room');
   assert.equal(over.phase, 'over');
+  // the page that reloads on the result screen has lost the result: it is sent again (once), after the room
+  assert.deepEqual(await a3.next('end'), { t: 'end', winner: -1, reason: 'timeout' });
   await a3.flush();
   assert.deepEqual(a3.pending().filter(m => m.t !== 'pong'), [], 'no start or camp for a finished game');
   // rematch from the reloaded page
@@ -367,4 +369,78 @@ test('dropping for an instant again and again is paid for with the resume delay:
   assert.deepEqual(await a.next('end'), { t: 'end', winner: 0, reason: 'forfeit', forfeit: true });
   assert.equal((await a.next('room')).phase, 'lobby');
   assert.deepEqual(s.logs, []);
+});
+
+test('practice against the AI: nobody is waiting, so every drop gets the full graceMs and nothing is spent', async t => {
+  // graceMs 400, away 150 ms each time: as an allowance this would be gone after three drops
+  const s = await server(t, { graceMs: 400, graceRefill: 0, resumeDelayMs: 5, stepsPerTick: 1 });
+  let client = await connect(s.wsUrl);
+  client.send({ t: 'practice', name: 'Solo' });
+  const room = await client.next('room');
+  client.send({ t: 'ready' });
+  await client.next('start');
+  for (let drop = 1; drop <= 8; drop++) {
+    await client.terminate();
+    await sleep(150);
+    client = await rejoin(s, room.code, room.token);
+    const back = await client.next(m => m.t === 'room' || m.t === 'error');
+    assert.equal(back.t, 'room', `drop ${drop}: the seat is still there (${back.code})`);
+    assert.equal(back.phase, 'battle');
+  }
+  assert.deepEqual(s.logs, []);
+});
+
+test('a battle result that went into a dead link is sent after the room on the rejoin, and only once', async t => {
+  const s = await server(t, { battleTimeLimit: 3, graceMs: 5000 });
+  const { a, b, code, roomA, roomB } = await pair(s);
+  await readyBoth(a, b, 'start');
+  b.ws.pause();                                   // B's link stops delivering; the server does not know yet
+  const endA = await a.next('end');
+  assert.deepEqual(endA, { t: 'end', winner: -1, reason: 'timeout' });
+  await b.terminate();
+  await a.next(m => m.t === 'peer' && m.state === 'lost');
+  const b2 = await rejoin(s, code, roomB.token);
+  const first = await b2.next(), second = await b2.next();
+  assert.deepEqual([first.t, first.phase, second], ['room', 'over', endA], 'room, then the missed result');
+  // the debt is cleared once sent
+  await b2.terminate();
+  const b3 = await rejoin(s, code, roomB.token);
+  assert.equal((await b3.next('room')).phase, 'over');
+  await b3.flush();
+  assert.deepEqual(b3.pending().filter(m => m.t !== 'pong'), []);
+  // a player who has readied up for the rematch has seen the result: nothing is owed
+  b3.send({ t: 'ready' });
+  await b3.next(m => m.t === 'room' && m.players[1].ready);
+  await b3.terminate();
+  const b4 = await rejoin(s, code, roomB.token);
+  await b4.next('room');
+  await b4.flush();
+  assert.deepEqual(b4.pending().filter(m => m.t !== 'pong'), []);
+  // Ann saw the result live, and has readied up for the rematch too: nothing is owed to her either
+  a.send({ t: 'ready' });
+  await a.next(m => m.t === 'room' && m.players[0].ready);
+  await a.terminate();
+  const a2 = await rejoin(s, code, roomA.token);
+  await a2.next('room');
+  await a2.flush();
+  assert.deepEqual(a2.pending().filter(m => m.t !== 'pong'), []);
+  assert.deepEqual(s.logs, []);
+});
+
+test('a decisive result is owed with the winner as numbered in that game', async t => {
+  const s = await server(t, { graceMs: 5000 });
+  const { a, b, code, roomB } = await pair(s);
+  await readyBoth(a, b, 'start');
+  b.ws.pause();
+  for (let n = 0; ; n++) {                        // Ann attacks, Bob never answers
+    const m = await a.next(x => x.t === 'snap' || x.t === 'end', 30000);
+    if (m.t === 'end') break;
+    if (n % 3 === 0) attackNearest(a, 0, m);
+  }
+  const endA = a.msgs.find(m => m.t === 'end');
+  assert.deepEqual([endA.winner, endA.reason], [0, 'rout']);
+  await b.terminate();
+  const b2 = await rejoin(s, code, roomB.token);
+  await b2.next('room');
+  assert.deepEqual(await b2.next('end'), endA, 'owed with the winner as numbered in that game');
 });

@@ -6,10 +6,11 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHttpHandler } from '../lib/http.js';
-import { createTokenBucket, clientIp, createIpCounter } from '../lib/limits.js';
+import { createTokenBucket, clientIp, createIpCounter, createFailureThrottle, proxyHops } from '../lib/limits.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SECRET = 'TOP-SECRET-FIXTURE';
@@ -26,9 +27,9 @@ function write(file, text) {
 }
 
 before(async () => {
-  // A throwaway tree: the real public/ is being edited by other tracks.
-  fs.mkdirSync(path.join(REPO, '.scratch', 'net'), { recursive: true });
-  fixture = fs.mkdtempSync(path.join(REPO, '.scratch', 'net', 'fixture-'));
+  // A throwaway tree in the system temp directory (removed in after()): nothing is written into the
+  // working copy, and a deep or read-only checkout cannot break the suite.
+  fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'legio-net-'));
   publicDir = path.join(fixture, 'public');
   write(path.join(publicDir, 'index.html'), INDEX);
   write(path.join(publicDir, 'client.js'), 'console.log("fixture");\n');
@@ -462,56 +463,89 @@ test('token bucket: odd clocks and odd arguments are safe', () => {
 
 // ---------- client address ----------
 
-const fakeReq = (remoteAddress, xff) => ({ socket: { remoteAddress }, headers: xff === undefined ? {} : { 'x-forwarded-for': xff } });
+const fakeReq = (remoteAddress, xff, extra = {}) => ({ socket: { remoteAddress }, headers: { ...(xff === undefined ? {} : { 'x-forwarded-for': xff }), ...extra } });
 
-test('clientIp: socket address unless the proxy is trusted', () => {
+test('clientIp: socket address unless the proxy is trusted; IPv6 is keyed by its /64', () => {
   assert.equal(clientIp(fakeReq('203.0.113.9', '198.51.100.7'), false), '203.0.113.9');
   assert.equal(clientIp(fakeReq('203.0.113.9', '198.51.100.7'), undefined), '203.0.113.9');
+  assert.equal(clientIp(fakeReq('203.0.113.9', '198.51.100.7'), 0), '203.0.113.9');
   assert.equal(clientIp(fakeReq('::ffff:203.0.113.9'), false), '203.0.113.9');
-  assert.equal(clientIp(fakeReq('2001:DB8::1'), false), '2001:db8::1');
-  assert.equal(clientIp(fakeReq('::1'), false), '::1');
+  assert.equal(clientIp(fakeReq('::ffff:cb00:7109'), false), '203.0.113.9');
+  assert.equal(clientIp(fakeReq('2001:DB8::1'), false), '2001:db8:0:0');
+  assert.equal(clientIp(fakeReq('::1'), false), '0:0:0:0');
 });
 
-test('clientIp: first X-Forwarded-For hop when the proxy is trusted', () => {
+test('clientIp: one key per IPv6 /64, whatever the spelling; another /64 is another client', () => {
+  const same = ['2001:db8:1:1::a', '2001:db8:1:1::b', '2001:db8:1:1:0:0:0:a', '2001:0db8:1:1::A', '2001:DB8:1:1:ffff:ffff:ffff:ffff',
+    '[2001:db8:1:1::a]:443', '2001:db8:1:1::a%eth0', '2001:db8:1:1:0:0:1.2.3.4'];
+  for (const addr of same) assert.equal(clientIp(fakeReq(addr), false), '2001:db8:1:1', addr);
+  assert.equal(clientIp(fakeReq('2001:db8:1:2::a'), false), '2001:db8:1:2');
+  assert.notEqual(clientIp(fakeReq('2001:db8:1:2::a'), false), clientIp(fakeReq('2001:db8:1:1::a'), false));
+  // behind a proxy the same rule applies to the forwarded address
+  assert.equal(clientIp(fakeReq('10.0.0.1', '2001:db8:1:1::a, 2001:db8:5:5::1'), 2), '2001:db8:1:1');
+  assert.equal(clientIp(fakeReq('10.0.0.1', '2001:db8:1:1::b'), true), '2001:db8:1:1');
+  assert.equal(clientIp(fakeReq('::ffff:1.2.3.4'), false), '1.2.3.4');
+  assert.equal(clientIp(fakeReq('::'), false), '0:0:0:0');
+  assert.equal(clientIp(fakeReq('1:2:3:4:5:6:7:8'), false), '1:2:3:4');
+});
+
+test('clientIp: true is one trusted proxy: the last X-Forwarded-For entry, never the first', () => {
   assert.equal(clientIp(fakeReq('10.0.0.1', '198.51.100.7'), true), '198.51.100.7');
-  assert.equal(clientIp(fakeReq('10.0.0.1', ' 198.51.100.7 , 10.0.0.2, 10.0.0.3'), true), '198.51.100.7');
-  assert.equal(clientIp(fakeReq('10.0.0.1', ['198.51.100.7, 10.0.0.2', '10.0.0.3']), true), '198.51.100.7');
+  assert.equal(clientIp(fakeReq('10.0.0.1', '6.6.6.6, 198.51.100.7'), true), '198.51.100.7');
+  assert.equal(clientIp(fakeReq('10.0.0.1', ' 6.6.6.6 , 10.0.0.2, 198.51.100.7 '), true), '198.51.100.7');
+  assert.equal(clientIp(fakeReq('10.0.0.1', ['6.6.6.6, 10.0.0.2', '198.51.100.7']), true), '198.51.100.7');
   assert.equal(clientIp(fakeReq('10.0.0.1', '198.51.100.7:51234'), true), '198.51.100.7');
-  assert.equal(clientIp(fakeReq('10.0.0.1', '[2001:db8::2]:443, 10.0.0.2'), true), '2001:db8::2');
-  assert.equal(clientIp(fakeReq('10.0.0.1', '::ffff:198.51.100.7'), true), '198.51.100.7');
+  assert.equal(clientIp(fakeReq('10.0.0.1', '6.6.6.6, [2001:db8::2]:443'), true), '2001:db8:0:0');
+  assert.equal(clientIp(fakeReq('10.0.0.1', '6.6.6.6, ::ffff:198.51.100.7'), true), '198.51.100.7');
+  // forging the left side buys nothing: every forged first entry gives the same client
+  for (let i = 1; i < 50; i++) assert.equal(clientIp(fakeReq('10.0.0.1', `10.1.${i}.1, 203.0.113.7`), true), '203.0.113.7');
 });
 
-test('clientIp: a missing or forged header falls back to the socket address', () => {
+test('clientIp: a missing, short or forged header falls back to the socket address', () => {
   const junk = [undefined, '', ' ', ',', 'unknown', 'localhost', '<script>', '1.2.3', '999.1.1.1', '__proto__',
     'a'.repeat(5000), '1.2.3.4\r\nX-Evil: 1', '\0', 42, {}, [], ['']];
   for (const xff of junk) {
     assert.equal(clientIp(fakeReq('10.0.0.1', xff), true), '10.0.0.1', JSON.stringify(xff)?.slice(0, 40));
+    assert.equal(clientIp(fakeReq('10.0.0.1', xff), 2), '10.0.0.1', JSON.stringify(xff)?.slice(0, 40));
   }
+  assert.equal(clientIp(fakeReq('10.0.0.1', '6.6.6.6, '), true), '10.0.0.1', 'the entry the proxy added is empty');
+  assert.equal(clientIp(fakeReq('10.0.0.1', '6.6.6.6, unknown'), true), '10.0.0.1');
+  // not enough entries for the number of trusted proxies
+  assert.equal(clientIp(fakeReq('10.0.0.1', '198.51.100.7'), 2), '10.0.0.1');
 });
 
 test('clientIp: an integer trusts that many proxies, counted from the right', () => {
   const req = fakeReq('10.0.0.1', '6.6.6.6, 198.51.100.7, 10.0.0.2'); // 6.6.6.6 was sent by the client itself
-  assert.equal(clientIp(req, true), '6.6.6.6');        // SPEC behaviour: first hop
+  assert.equal(clientIp(req, true), '10.0.0.2');       // true = 1
   assert.equal(clientIp(req, 1), '10.0.0.2');
   assert.equal(clientIp(req, 2), '198.51.100.7');
   assert.equal(clientIp(req, 3), '6.6.6.6');
   assert.equal(clientIp(req, 4), '10.0.0.1');          // fewer hops than expected: socket address
   assert.equal(clientIp(req, 0), '10.0.0.1');
+  assert.equal(clientIp(req, -1), '10.0.0.1');
   assert.equal(clientIp(req, 1.5), '10.0.0.1');
   assert.equal(clientIp(req, 'yes'), '10.0.0.1');
+  assert.deepEqual([true, 1, 5, false, 0, -2, 1.5, 'yes', null, undefined].map(proxyHops), [1, 1, 5, 0, 0, 0, 0, 0, 0, 0]);
 });
 
-test('clientIp: always a string, never a throw', () => {
+test('clientIp: other headers (CF-Connecting-IP, X-Real-IP) are never believed', () => {
+  const req = fakeReq('10.0.0.1', '198.51.100.7', { 'cf-connecting-ip': '6.6.6.6', 'x-real-ip': '7.7.7.7', forwarded: 'for=8.8.8.8' });
+  assert.equal(clientIp(req, true), '198.51.100.7');
+  assert.equal(clientIp(req, false), '10.0.0.1');
+});
+
+test('clientIp: always a non-empty string, never a throw', () => {
   for (const req of [undefined, null, {}, { socket: null }, { socket: {} }, { headers: null, socket: { remoteAddress: 7 } },
     { socket: { remoteAddress: 'not an ip' } }]) {
     assert.equal(clientIp(req, true), 'unknown');
     assert.equal(clientIp(req, false), 'unknown');
+    assert.equal(clientIp(req, 3), 'unknown');
   }
 });
 
 test('clientIp: works on a real request', async () => {
   const seen = [];
-  const probe = http.createServer((req, res) => { seen.push(clientIp(req, false), clientIp(req, true)); res.end(); });
+  const probe = http.createServer((req, res) => { seen.push(clientIp(req, false), clientIp(req, true), clientIp(req, 2)); res.end(); });
   await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
   try {
     await rawExchange(probe.address().port,
@@ -519,7 +553,45 @@ test('clientIp: works on a real request', async () => {
   } finally {
     await new Promise(resolve => probe.close(resolve));
   }
-  assert.deepEqual(seen, ['127.0.0.1', '198.51.100.7']);
+  assert.deepEqual(seen, ['127.0.0.1', '10.0.0.2', '198.51.100.7']);
+});
+
+// ---------- failure throttle ----------
+
+test('failure throttle: blocked after max failures inside the window, free again when the oldest ages out', () => {
+  let t = 1000;
+  const throttle = createFailureThrottle(3, 60000, () => t);
+  assert.equal(throttle.blocked('a'), false);
+  throttle.fail('a'); t += 10000; throttle.fail('a'); t += 10000;
+  assert.equal(throttle.blocked('a'), false, 'two failures');
+  throttle.fail('a');
+  assert.equal(throttle.blocked('a'), true, 'the third one blocks');
+  assert.equal(throttle.blocked('b'), false, 'another key is not affected');
+  t += 39999;                                          // 59999 ms after the first failure
+  assert.equal(throttle.blocked('a'), true);
+  t += 2;                                              // the first has aged out
+  assert.equal(throttle.blocked('a'), false);
+  throttle.fail('a');
+  assert.equal(throttle.blocked('a'), true, 'a fresh failure is counted at once');
+  t += 120000;
+  assert.equal(throttle.blocked('a'), false);
+  assert.equal(throttle.size(), 0, 'expired keys are dropped');
+});
+
+test('failure throttle: bounded memory, prune, odd keys and bad configuration', () => {
+  let t = 0;
+  const throttle = createFailureThrottle(2, 1000, () => t);
+  for (let i = 0; i < 25000; i++) throttle.fail('k' + i);
+  assert.ok(throttle.size() <= 10000, `${throttle.size()} keys`);
+  t += 5000;
+  throttle.prune();
+  assert.equal(throttle.size(), 0);
+  for (const key of ['__proto__', 'constructor', '', undefined]) {
+    throttle.fail(key); throttle.fail(key);
+    assert.equal(throttle.blocked(key), true, String(key));
+  }
+  for (const bad of [0, -1, NaN, undefined, 'x']) assert.equal(createFailureThrottle(bad, 1000).blocked('a'), true, String(bad));
+  assert.equal(createFailureThrottle(3, 1000, null).blocked('a'), false);
 });
 
 // ---------- per-address counter ----------

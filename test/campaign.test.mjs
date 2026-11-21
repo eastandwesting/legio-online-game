@@ -210,10 +210,26 @@ test('setMove: adjacent marches only, null cancels', () => {
   assert.deepEqual(c.moves, [{ 1: 3 }, {}]);
   assert.equal(C.setMove(c, 0, 1, null), true);
   assert.deepEqual(c.moves, [{}, {}]);
-  assert.equal(C.setMove(c, 0, 1, null), true, 'cancelling nothing is fine');
+  assert.equal(C.setMove(c, 0, 1, null), false, 'cancelling nothing changes nothing');
+  assert.deepEqual(c.moves, [{}, {}]);
   refused(c, () => C.setMove(c, 0, 1, 0), 'own province is not a march');
   refused(c, () => C.setMove(c, 0, 1, 4), 'two steps away');
   refused(c, () => C.setMove(c, 0, 1, 12), 'far away');
+});
+
+test('setMove: true only when the pending marches changed (an order that changes nothing is false)', () => {
+  const c = C.newCampaign();
+  assert.equal(C.setMove(c, 0, 1, null), false, 'nothing to cancel');
+  assert.equal(C.setMove(c, 0, 1, 2), true, 'new march');
+  assert.equal(C.setMove(c, 0, 1, 2), false, 'the same destination again');
+  assert.deepEqual(c.moves, [{ 1: 2 }, {}]);
+  assert.equal(C.setMove(c, 0, 1, 3), true, 'another destination');
+  assert.equal(C.setMove(c, 0, 1, null), true, 'a real cancel');
+  assert.equal(C.setMove(c, 0, 1, null), false, 'and again');
+  assert.equal(C.setMove(c, 1, 2, 10), true);
+  assert.equal(C.setMove(c, 1, 2, 10), false);
+  assert.deepEqual(c.moves, [{}, { 2: 10 }]);
+  assert.equal(C.recruit(c, 0, 0, 'sword'), true, 'recruiting always changes something');
 });
 
 test('setMove: rejects bad input and other players\' armies', () => {
@@ -614,35 +630,143 @@ test('AI: deterministic, and repeating a turn\'s orders changes nothing', () => 
   assert.deepEqual(run(), run());
 });
 
-test('AI: the garrison holds the capital while an enemy is within 2 steps', () => {
-  // 8 units would normally march on the enemy capital
-  const c = setup([[0, 0, units('sword', 8)], [1, 4, units('sword', 2)], [1, 12, units('sword', 2)]]);
-  assert.equal(C.aiTurn(c, 0), true);
-  assert.equal(aiMove(c, 0, 1), null, 'enemy at Highwold (2 steps): stay');
-  armyOf(c, 2).prov = 6; // 3 steps away: no longer a threat
-  assert.equal(C.aiTurn(c, 0), true);
-  assert.notEqual(aiMove(c, 0, 1), null, 'threat gone: march');
-  // mirrored for the other seat
-  const d = setup([[1, 12, units('sword', 8)], [0, 7, units('sword', 2)], [0, 0, units('sword', 2)]]);
-  C.aiTurn(d, 1);
-  assert.equal(aiMove(d, 1, 1), null);
+// One turn passes without a resolution: orders are cleared, the turn counter moves (state the AI keeps stays).
+const nextTurn = c => { c.turn++; c.moves = [{}, {}]; c.ready = [false, false]; };
+// The AI gives its orders twice per turn (the second call must change nothing, hold counter included).
+const aiOrders = (c, p) => { C.aiTurn(c, p); C.aiTurn(c, p); };
+
+test('AI: the garrison holds for at most 2 turns in a row while a stronger enemy is within 2 steps, then attacks', () => {
+  // 3 swords (180 men) against 6 swords (360) two steps away at Highwold; 180 < 0.7 * 360
+  const c = setup([[0, 0, units('sword', 3)], [1, 4, units('sword', 6)]]);
+  aiOrders(c, 0);
+  assert.equal(aiMove(c, 0, 1), null, 'turn 1: hold');
+  nextTurn(c); aiOrders(c, 0);
+  assert.equal(aiMove(c, 0, 1), null, 'turn 2: hold');
+  nextTurn(c); aiOrders(c, 0);
+  assert.ok([1, 2].includes(aiMove(c, 0, 1)), `turn 3: out toward the enemy, got ${aiMove(c, 0, 1)}`);
+  // the same for the other seat
+  const d = setup([[1, 12, units('sword', 3)], [0, 7, units('sword', 6)]]);
+  aiOrders(d, 1); assert.equal(aiMove(d, 1, 1), null);
+  nextTurn(d); aiOrders(d, 1); assert.equal(aiMove(d, 1, 1), null);
+  nextTurn(d); aiOrders(d, 1); assert.ok([9, 10].includes(aiMove(d, 1, 1)));
+  // the count is of consecutive turns: a turn without a threat starts it again
+  const e = setup([[0, 0, units('sword', 3)], [1, 4, units('sword', 6)]]);
+  aiOrders(e, 0); nextTurn(e); aiOrders(e, 0); nextTurn(e);
+  e.armies[1].prov = 6;                                  // threat gone for a turn
+  aiOrders(e, 0); assert.equal(aiMove(e, 0, 1), null);
+  nextTurn(e); e.armies[1].prov = 4; aiOrders(e, 0);
+  assert.equal(aiMove(e, 0, 1), null, 'turn 1 again');
 });
 
-test('AI: the garrison attacks an adjacent enemy only with 1.5x its men', () => {
-  const c = setup([[0, 0, units('sword', 3)], [1, 2, units('sword', 2)]]); // 180 vs 120: exactly 1.5x
-  C.aiTurn(c, 0);
-  assert.equal(aiMove(c, 0, 1), 2, 'attacks');
-  armyOf(c, 2).units.push(unit('cav', 1)); // 180 vs 121
-  C.aiTurn(c, 0);
-  assert.equal(aiMove(c, 0, 1), null, 'not strong enough: the earlier order is withdrawn');
-  // strong enough for the neighbour but not for everything near the capital: stay
-  const d = setup([[0, 0, units('sword', 3)], [1, 2, units('sword', 1)], [1, 4, units('sword', 2)]]);
-  C.aiTurn(d, 0);
-  assert.equal(aiMove(d, 0, 1), null);
-  // an enemy two steps away is never attacked from the capital
-  const e = setup([[0, 0, units('sword', 8)], [1, 4, [unit('sword', 1)]]]);
-  C.aiTurn(e, 0);
-  assert.equal(aiMove(e, 0, 1), null);
+test('AI: the garrison attacks at once with 70% of the men near the capital, the nearest enemy first', () => {
+  const near = men => {      // an enemy of exactly `men` men at Highwold, two steps from the capital
+    const foe = units('sword', 4);
+    foe.push(unit('archer', men - 240));
+    return setup([[0, 0, units('sword', 3)], [1, 4, foe]]);   // the garrison has 180 men
+  };
+  let c = near(257);         // 0.7 * 257 = 179.9
+  aiOrders(c, 0);
+  assert.ok([1, 2].includes(aiMove(c, 0, 1)), 'strong enough: attacks at once, an enemy two steps away included');
+  c = near(258);             // 0.7 * 258 = 180.6
+  aiOrders(c, 0);
+  assert.equal(aiMove(c, 0, 1), null, 'one man short: holds');
+  // everything near the capital counts, not only the army that is attacked
+  const d = setup([[0, 0, units('sword', 3)], [1, 2, units('sword', 1)], [1, 4, units('sword', 5)]]);
+  aiOrders(d, 0);
+  assert.equal(aiMove(d, 0, 1), null, '180 against 60 + 300');
+  // the nearest enemy army is the target: the small one next door, not the big one behind it
+  const e = setup([[0, 0, units('sword', 8)], [1, 2, units('sword', 2)], [1, 4, units('sword', 5)]]);
+  aiOrders(e, 0);
+  assert.equal(aiMove(e, 0, 1), 2);
+  // an enemy three steps away is no threat at all: the army goes about its business
+  const f = setup([[0, 0, units('sword', 8)], [1, 6, [unit('sword', 1)]]]);
+  aiOrders(f, 0);
+  assert.notEqual(aiMove(f, 0, 1), null);
+});
+
+test('AI: a sortie is followed through: next to the enemy army it attacks instead of walking home again', () => {
+  // 5 units (300 men) against a host of 16 (960) at Highwold: the garrison holds twice, then goes out
+  const c = setup([[0, 0, units('sword', 5)], [1, 4, units('sword', 16)]]);
+  for (let t = 0; t < 2; t++) { aiOrders(c, 0); assert.equal(aiMove(c, 0, 1), null); nextTurn(c); }
+  aiOrders(c, 0);
+  const out = aiMove(c, 0, 1);
+  assert.ok([1, 2].includes(out));
+  C.resolveMoves(c);
+  assert.equal(armyOf(c, 1).prov, out);
+  nextTurn(c); aiOrders(c, 0);
+  assert.equal(aiMove(c, 0, 1), 4, 'adjacent to the host: attacks it (before: back to the capital, and round again)');
+});
+
+test('AI: a passive enemy two steps from the capital is engaged or something is captured within 8 turns', () => {
+  for (const ai of [0, 1]) {
+    const foe = 1 - ai, cap = C.CAPITAL[ai];
+    const twoSteps = C.PROVS.map((_, prov) => prov).filter(prov => prov !== C.CAPITAL[foe] && prov !== cap &&
+      !C.ADJ[cap].includes(prov) && C.ADJ[cap].some(n => C.ADJ[n].includes(prov)));
+    assert.ok(twoSteps.length >= 2);
+    for (const prov of twoSteps) {
+      for (const stack of [units('sword', 12), units('sword', 6), units('cav', 1)]) {
+        const c = C.newCampaign(), label = `ai seat ${ai}, ${stack.length} units parked at ${prov}`;
+        c.armies.push({ id: c.nextId++, owner: foe, prov, units: stack });
+        c.owner[prov] = foe;
+        let acted = false;
+        for (let t = 1; t <= 8 && !acted; t++) {
+          assert.equal(C.aiTurn(c, ai), true, label);
+          const r = playTurn(c, { label });
+          acted = r.battles.length > 0 || r.captured;
+        }
+        assert.equal(acted, true, `${label}: nothing happened in 8 turns`);
+      }
+    }
+  }
+});
+
+test('AI: a lone garrison that marches out on the turns it expects an assault cannot hold the host off for ever', () => {
+  // The AI host (9 swords) stands next to the human capital, which is held by 4 swords. The human knows
+  // nothing of the AI's orders and tries every pattern a predictable AI could be beaten with: marching
+  // the garrison at the host on all turns, or on odd, even, or every third turn.
+  const patterns = { always: () => true, odd: t => t % 2 === 1, even: t => t % 2 === 0, third: t => t % 3 === 0, twoOfThree: t => t % 3 !== 0 };
+  for (const ai of [1, 0]) {
+    for (const [name, marches] of Object.entries(patterns)) {
+      const human = 1 - ai, capital = C.CAPITAL[human], hostAt = C.ADJ[capital][1];
+      const c = setup([[human, capital, units('sword', 4)], [ai, hostAt, units('sword', 9)]], { owner: { [hostAt]: human } });
+      const garrison = c.armies[0].id, label = `ai seat ${ai}, pattern ${name}`;
+      let engaged = false;
+      for (let t = 1; t <= 20 && !engaged && c.winner === null; t++) {
+        if (marches(t)) C.setMove(c, human, garrison, hostAt);
+        assert.equal(C.aiTurn(c, ai), true, label);
+        const r = playTurn(c, { label });
+        engaged = r.battles.length > 0 || c.winner !== null;
+      }
+      assert.equal(engaged, true, `${label}: still no battle after 20 turns`);
+    }
+  }
+});
+
+test('AI: two AI armies that bounce head-on do not bounce for ever', () => {
+  const c = setup([[0, 4, units('sword', 8)], [1, 7, units('sword', 8)]]);
+  C.aiTurn(c, 0); C.aiTurn(c, 1);
+  assert.equal(aiMove(c, 0, 1), 7);
+  assert.equal(aiMove(c, 1, 2), 4);
+  assert.deepEqual(playTurn(c).battles, [], 'first contact: both turn back');
+  assert.equal(c.bounced.length, 2);
+  let fought = false;
+  for (let t = 0; t < 12 && !fought; t++) {
+    C.aiTurn(c, 0); C.aiTurn(c, 1);
+    fought = playTurn(c).battles.length > 0;
+  }
+  assert.equal(fought, true, 'they meet within 12 more turns');
+});
+
+test('AI: what happens after a bounce does not follow the turn parity', () => {
+  // Over many turns (and gold levels) the army waits on some even and some odd turns after a bounce.
+  const waits = { even: 0, odd: 0 }, attacks = { even: 0, odd: 0 };
+  for (let turn = 2; turn < 60; turn++) {
+    const c = setup([[0, 4, units('sword', 8)], [1, 7, units('sword', 8)]]);
+    c.turn = turn; c.gold = [turn * 7, turn * 13]; c.bounced = [1, 2];
+    C.aiTurn(c, 0);
+    (aiMove(c, 0, 1) === null ? waits : attacks)[turn % 2 ? 'odd' : 'even']++;
+  }
+  for (const k of ['even', 'odd']) assert.ok(waits[k] > 3 && attacks[k] > 3, `${k}: waits ${waits[k]}, attacks ${attacks[k]}`);
 });
 
 test('AI: never walks into a stronger enemy army unless it has 12+ units', () => {
@@ -708,18 +832,6 @@ test('AI: idle small armies join up instead of waiting forever', () => {
     assault = playTurn(c).battles.some(b => b.prov === 12);
   }
   assert.equal(assault, true, 'the AI must eventually assault the capital');
-});
-
-test('AI: two AI armies that bounce head-on do not bounce forever', () => {
-  const c = setup([[0, 4, units('sword', 8)], [1, 7, units('sword', 8)]]);
-  C.aiTurn(c, 0); C.aiTurn(c, 1);
-  assert.equal(aiMove(c, 0, 1), 7);
-  assert.equal(aiMove(c, 1, 2), 4);
-  assert.deepEqual(playTurn(c).battles, [], 'first contact: both turn back');
-  assert.equal(c.bounced.length, 2);
-  C.aiTurn(c, 0); C.aiTurn(c, 1);
-  assert.equal([aiMove(c, 0, 1), aiMove(c, 1, 2)].filter(x => x !== null).length, 1, 'exactly one side waits');
-  assert.equal(playTurn(c).battles.length, 1, 'second turn: they fight');
 });
 
 test('AI: beats a passive opponent from either seat', () => {

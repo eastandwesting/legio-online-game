@@ -6,3 +6,9 @@ services:
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /healthz
+    envVars:
+      # Number of proxies in front of the app. Render sets RENDER and the server then defaults to 1 anyway;
+      # it is spelled out here so that it is easy to change. After the first visit read the "proxy check"
+      # line in the logs: each player must show up as their own address (README, Deploy).
+      - key: TRUST_PROXY_HOPS
+        value: "1"

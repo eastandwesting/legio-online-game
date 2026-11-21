@@ -254,6 +254,22 @@ test('infantry attacks the nearest enemy; spears prefer cavalry within 220', () 
   assert.deepEqual(side(b, 0).map(r => r.order), [{ t: 'attack', target: 3 }, { t: 'attack', target: 3 }], 'cavalry 300 away is ignored');
 });
 
+test('a spear keeps fighting an enemy in contact instead of walking off after cavalry it cannot catch', () => {
+  const armies = [full('spear', 1), [...full('sword', 1), ...full('cav', 1)]];
+  // a sword 30 away, the cavalry 150 away: the sword is on top of the spear
+  let b = decide(armies, ([sp], [esw, ecav]) => { place(sp, 400, 450); place(esw, 430, 450); place(ecav, 550, 450); });
+  assert.deepEqual(b.regs[0].order, { t: 'attack', target: 2 }, 'fights the sword');
+  // a spear that is already marching after the cavalry turns round when a sword is on top of it
+  b = decide(armies, ([sp], [esw, ecav], bt) => {
+    place(sp, 400, 450); place(esw, 420, 450); place(ecav, 550, 450);
+    giveOrder(bt, 0, [sp.id], { t: 'attack', target: ecav.id });
+  });
+  assert.deepEqual(b.regs[0].order, { t: 'attack', target: 2 });
+  // nobody within 45: the cavalry is still the first choice (SPEC 4)
+  b = decide(armies, ([sp], [esw, ecav]) => { place(sp, 400, 450); place(esw, 450, 450); place(ecav, 550, 450); });
+  assert.deepEqual(b.regs[0].order, { t: 'attack', target: 3 }, 'a sword 50 away is not in contact');
+});
+
 test('archers shoot the weakest enemy in range and close in when nothing is', () => {
   const armies = [full('archer', 1), full('sword', 3)];
   let b = decide(armies, ([ar], [e1, e2, e3]) => {

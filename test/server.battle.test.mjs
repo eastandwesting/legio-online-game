@@ -1,6 +1,6 @@
 // Quick battles end to end: start, orders, snapshots, end, rematch, practice bot, time limit.
 import assert from 'node:assert/strict';
-import { test, startTestServer, connect, pair, readyBoth, alive, attackNearest } from './harness.mjs';
+import { test, startTestServer, connect, pair, readyBoth, alive, attackNearest, marchToBattle } from './harness.mjs';
 
 async function server(t, options) {
   const s = await startTestServer(options);
@@ -151,4 +151,48 @@ test('orders: move, moves, attack and stop act on the own side only and only dur
   snap = await waitUntil(then.time + 1);
   assert.ok(pos(snap, cav[0])[0] > pos(then, cav[0])[0] + 50, 'cavalry rides at the enemy');
   assert.deepEqual(pos(snap, sword[0]), pos(halted, sword[0]), 'no friendly fire order');
+});
+
+test('start carries startMen: every regiment of both sides with its men at the start, again on a rejoin', async t => {
+  const s = await server(t, { stepsPerTick: 1, graceMs: 5000, resumeDelayMs: 20 });
+  const { a, b, code, roomA } = await pair(s);
+  const [startA, startB] = await readyBoth(a, b, 'start');
+  assert.deepEqual(startA.startMen, startB.startMen, 'both sides get both armies');
+  const ids = Object.keys(startA.startMen);
+  assert.deepEqual(ids.sort((x, y) => x - y), Array.from({ length: 18 }, (_, i) => String(i + 1)));
+  const first = await a.next('snap');
+  for (const r of first.regs) {
+    assert.ok(Number.isInteger(startA.startMen[String(r[0])]) && startA.startMen[String(r[0])] >= 1);
+    assert.equal(startA.startMen[String(r[0])], r[6], `regiment ${r[0]}: men at the start`);
+  }
+  assert.deepEqual(Object.values(startA.startMen).slice(0, 9), [60, 60, 60, 60, 60, 40, 40, 24, 24]);
+
+  // fight until somebody is clearly hurt, then reload: the denominators must not move
+  let hurt = null;
+  for (let n = 0; !hurt; n++) {
+    const m = await a.next(x => x.t === 'snap', 30000);
+    if (n % 3 === 0) { attackNearest(a, 0, m); attackNearest(b, 1, m); }
+    hurt = m.regs.find(r => r[6] < startA.startMen[String(r[0])] - 5 && r[8] !== 'dead');
+  }
+  await a.terminate();
+  const a2 = await connect(s.wsUrl);
+  a2.send({ t: 'rejoin', code, token: roomA.token });
+  await a2.next('room');
+  const again = await a2.next('start');
+  assert.deepEqual(again.startMen, startA.startMen, 'the same numbers after the rejoin');
+  const snap = await a2.next('snap');
+  assert.ok(snap.regs.some(r => r[6] < again.startMen[String(r[0])]), 'while the regiments are hurt');
+});
+
+test('start carries startMen of a campaign battle: units that came in below full strength', async t => {
+  const s = await server(t, { battleTimeLimit: 0.5, resolveDelayMs: 300 });
+  const { a, b, code } = await pair(s, 'campaign');
+  await readyBoth(a, b, 'camp');
+  await marchToBattle(a, b, 6);              // resolves with the 300 ms delay before the battle begins
+  const room = s.game._rooms.get(code);
+  room.camp.armies.find(x => x.id === 1).units[0].men = 33;     // Red's first sword comes in wounded
+  room.camp.armies.find(x => x.id === 2).units[3].men = 17;     // Blue's archers too
+  const [startA, startB] = await Promise.all([a.next('start'), b.next('start')]);
+  assert.deepEqual(startA.startMen, startB.startMen);
+  assert.deepEqual(startA.startMen, { 1: 33, 2: 60, 3: 60, 4: 40, 5: 60, 6: 60, 7: 60, 8: 17 });
 });

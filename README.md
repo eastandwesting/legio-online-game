@@ -40,8 +40,10 @@ Needs Node 20 or newer. The only dependency is `ws`.
 - Hits from the flank hurt more, hits from behind most of all, and they break morale. A regiment that
   loses its nerve routs and leaves the field.
 - Both sides are resolved at the same instant each tick, so neither side has an edge from ordering.
-- A battle ends when one army routs, or at the 5-minute limit. At the limit the defender holds (in a
-  campaign); in a quick battle the side with more of its army left wins, and near-equal is a draw.
+- A battle ends when one army routs, or at the 5-minute limit. At the limit each side's share is what is
+  left of its starting men (a routing regiment counts for half). In a quick battle the larger share wins and
+  a gap under 2 points is a draw. In a campaign battle the defender holds unless its share is below
+  three quarters of the attacker's, so running away from a whole army does not win.
 
 ### Campaign rules
 
@@ -51,8 +53,9 @@ Needs Node 20 or newer. The only dependency is `ws`.
   battle; armies that try to swap provinces turn back.
 - Winners keep their survivors, regrouped into full-strength units. Units standing in your own
   provinces regain 25% of their strength each turn.
-- The province owner is the defender. Take the enemy capital to win; both capitals falling in one turn
-  is a draw.
+- The province owner is the defender. If a battle runs out of time the defender holds, unless it has lost
+  clearly more of its army than the attacker (see above). The loser's army is removed. Take the enemy
+  capital to win; both capitals falling in one turn is a draw.
 - If one human ends their turn and the other stalls, a 90-second hurry-up timer ends it for them.
 
 ## Layout
@@ -76,12 +79,46 @@ land on different instances and never meet.
 - **Render**: `render.yaml` is a ready blueprint (free plan, health check `/healthz`). New > Blueprint,
   pick the repository.
 - **Anything with Docker** (Fly.io, Railway, a VPS): use the `Dockerfile`; it listens on `PORT`.
-- Behind a proxy the client IP is read from `X-Forwarded-For` when the `RENDER` environment variable is
-  set; otherwise pass `trustProxy: true` to `createGameServer`.
+- **Behind a proxy, set `TRUST_PROXY_HOPS`** to the number of proxies in front of the app (1 on Render, where it
+  is the default; 0 = none, the default everywhere else). The per-address limits count players by their
+  address, and behind a proxy the socket address is the proxy's. With N hops the address is taken from the
+  N-th entry of `X-Forwarded-For` counted from the right. Each proxy appends the address it received the
+  connection from to that header, so the entries on the left are whatever the client wrote and can be
+  forged one per connection; the rightmost entries were added by your own proxies and can be trusted.
+  Set it too low and a client can pick its own address (limits bypassed); set it too high (or when no proxy
+  is there) and every player shares one address or the proxy's, and the 20-per-address cap hits real players.
+  The first proxied connection logs a line showing the header and the client it was counted as: check it
+  once after deploying and raise or lower `TRUST_PROXY_HOPS` until each player shows up as their own
+  address. Only the `X-Forwarded-For` header is used.
 
 Things to expect on a free tier: the service sleeps when idle (first visit can take about a minute) and
 any restart drops games in progress. `GET /healthz` returns `ok`; `GET /healthz?stats` adds room and
 connection counts.
 
-Limits: 200 rooms, 500 connections, 20 per IP, 60-message burst per connection. All are options of
-`createGameServer`.
+Limits (options of `createGameServer`; environment variables override the defaults, and a value that is not
+a positive integer is ignored):
+
+| Limit | Default | Environment |
+|---|---|---|
+| Rooms (lobbies and games) | 60 | `MAX_ROOMS` |
+| Connections | 500 | `MAX_CONNECTIONS` |
+| Connections per address | 20 (40 behind a proxy: a proxy address can stand for many players) | `MAX_PER_IP` |
+| Message burst per connection | 60, refilling 30 a second | |
+| Sockets in no room that only ping | closed after 5 minutes | |
+| Abandoned rooms per address | 4 (the fifth create drops that address's oldest) | |
+| Failed joins per address | 8 a minute, then joins are answered `rate` | |
+
+When the server is full, `create` and `practice` are answered `server_full`; a room is never destroyed to
+make space for someone else's, so a player who reloads keeps their game (their seat is held for the grace
+period: 60 seconds, as an allowance that refills slowly in a running game against another human, and in full
+for every drop in the lobby or against the AI).
+
+Why 60 rooms: measured on a development desktop, a practice battle costs 0.02 to 0.05 ms of CPU per 50 ms tick
+(simulation, bot, snapshot and send; 25 to 200 concurrent battles; 200 battles used about 8% of one core).
+The free Render instance has 0.1 CPU: 10 ms of CPU in each 100 ms period, after which the whole process,
+event loop included, is paused until the next period. With two ticks per period, 60 battles need 2.4 to 6 ms
+of the 10 (about 0.03 ms each: 3.6 ms), which leaves room for garbage collection, HTTP, handshakes and a
+slower core. The former 200 would have needed 8 to 20 ms: 80% of the allowance at the very best and usually
+more than all of it, so ticks run late and battles slow down. (Event-loop delay stayed within timer
+resolution at every size on the test machine, so it does not show the limit; the arithmetic against the
+quota does. Raise `MAX_ROOMS` on a paid plan with more CPU.)

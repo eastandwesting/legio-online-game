@@ -12,9 +12,12 @@
 //              Every game timer captures gen and does nothing if it changed (see later()).
 // Seat timers (grace) and the resume timer outlive games on purpose; they are guarded by their own
 // identity instead of gen, and cleared when the seat or room goes away.
-// In a running game grace is an allowance per seat, not a fresh graceMs per drop: time away is spent
-// from it and it refills slowly while connected, so nobody can freeze a game for ever by dropping
-// again and again. Outside a game (lobby, result screen) nobody is kept waiting: every drop gets graceMs.
+// In a running game against another human, grace is an allowance per seat, not a fresh graceMs per
+// drop: time away is spent from it and it refills slowly while connected, so nobody can freeze a game
+// for ever by dropping again and again. Outside such a game (lobby, result screen, practice against the
+// AI) nobody is kept waiting: every drop gets graceMs.
+// A human owed a result it may have missed (the quick battle ended, or the opponent forfeited) gets it
+// right after the 'room' of its next rejoin: seat.owedEnd holds the message until it is sent.
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -25,7 +28,7 @@ import { createBattle, giveOrder, step, snapshot, battleSurvivors, TYPES, W, H, 
 import { botThink } from './bot.js';
 import * as C from './campaign.js';
 import { createHttpHandler } from './lib/http.js';
-import { createTokenBucket, clientIp, createIpCounter } from './lib/limits.js';
+import { createTokenBucket, clientIp, proxyHops, createIpCounter, createFailureThrottle } from './lib/limits.js';
 import { MAX_FRAME, parseFrame, cleanName, cleanCode, battleOrders, campaignOrder, numberOption } from './lib/server-input.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +44,9 @@ const CLOSE_WAIT_MS = 500;            // shutdown: time for close handshakes bef
 const OVERRUN_S = 5;                  // a battle this far past its limit is a sim fault
 const MAX_TIMER_MS = 2 ** 31 - 1;     // setTimeout fires at once for anything longer
 const REFUSE_LINGER_MS = 1000;        // a refused connection that does not close by itself is cut after this
+const MAX_ABANDONED_PER_IP = 4;       // rooms without a connected human that one address may keep (SPEC 7.2)
+const DEFAULT_MAX_ROOMS = 60;         // measured against 0.1 CPU, see README: limits
+const JOIN_FAILS = 8, JOIN_WINDOW_MS = 60000;   // failed joins per address per window (SPEC 7.2)
 
 const ERRORS = {
   badRoom: { t: 'error', code: 'bad_room', msg: 'Room not found or full.' },
@@ -52,10 +58,26 @@ const ERRORS = {
 
 const noop = () => {};
 
+// A positive integer from the environment, or undefined (unset or invalid: ignored).
+function envInt(name, min = 1) {
+  const v = process.env[name];
+  if (typeof v !== 'string' || !/^\s*\d{1,9}\s*$/.test(v)) return undefined;
+  return Number(v) >= min ? Number(v) : undefined;
+}
+
+// Proxies of our own in front of this server. An option wins; then TRUST_PROXY_HOPS; then 1 on Render, else 0.
+function readHops(option) {
+  if (option !== undefined) return proxyHops(option);
+  const env = envInt('TRUST_PROXY_HOPS', 0);
+  if (env !== undefined) return env;
+  return process.env.RENDER ? 1 : 0;
+}
+
 function readOptions(o) {
   const num = (key, fallback, min) => numberOption(o[key], fallback, min);
   const ms = (key, fallback, min) => Math.min(MAX_TIMER_MS, num(key, fallback, min));
   const rate = o.rate !== null && typeof o.rate === 'object' ? o.rate : {};
+  const hops = readHops(o.trustProxy);
   return {
     tickMs: ms('tickMs', 50, 1),
     stepsPerTick: Math.min(1000, Math.floor(num('stepsPerTick', 1, 1))),   // extension for fast tests: sim steps per timer tick
@@ -68,11 +90,15 @@ function readOptions(o) {
     hurryMs: ms('hurryMs', 90000),
     heartbeatMs: ms('heartbeatMs', 25000, 1),
     idleRoomMs: ms('idleRoomMs', 45 * 60000, 1),
-    maxRooms: Math.min(100000, num('maxRooms', 200)),      // far below the 36^4 codes, so newCode() ends
-    maxConnections: num('maxConnections', 500),
-    maxPerIp: num('maxPerIp', 20),
+    unseatedIdleMs: ms('unseatedIdleMs', 5 * 60000, 1),
+    maxRooms: Math.min(100000, num('maxRooms', envInt('MAX_ROOMS') ?? DEFAULT_MAX_ROOMS)),   // far below the 36^4 codes, so newCode() ends
+    maxConnections: num('maxConnections', envInt('MAX_CONNECTIONS') ?? 500),
+    // behind a proxy the proxy's address may stand for many players: more room per address
+    maxPerIp: num('maxPerIp', envInt('MAX_PER_IP') ?? (hops ? 40 : 20)),
+    joinFails: num('joinFails', JOIN_FAILS, 1),
+    joinWindowMs: ms('joinWindowMs', JOIN_WINDOW_MS, 1),
     rate: { capacity: numberOption(rate.capacity, 60), refillPerSec: numberOption(rate.refillPerSec, 30) },
-    trustProxy: o.trustProxy === undefined ? !!process.env.RENDER : o.trustProxy,
+    trustProxy: hops,
     log: typeof o.log === 'function' ? o.log : console.log,
     publicDir: typeof o.publicDir === 'string' && o.publicDir ? o.publicDir : path.join(HERE, 'public'),
   };
@@ -83,6 +109,8 @@ export function createGameServer(options = {}) {
   const rooms = new Map();            // code -> room
   const conns = new Set();            // accepted sockets
   const ips = createIpCounter(cfg.maxPerIp);
+  const joinFails = createFailureThrottle(cfg.joinFails, cfg.joinWindowMs);
+  let proxyNoted = false;             // the one-time note about X-Forwarded-For was logged
   let loops = [];                     // server-wide intervals: battle ticks, heartbeat, idle sweep
   let stopped = false;
   let closing = null;                 // the promise of the one shutdown
@@ -156,9 +184,9 @@ export function createGameServer(options = {}) {
       if (!rooms.has(code)) return code;
     }
   }
-  function newRoom(mode) {
+  function newRoom(mode, ip) {
     const room = {
-      code: newCode(), mode, phase: 'lobby', seats: [], gen: 0, dead: false, timers: new Set(), faults: 0,
+      code: newCode(), mode, ip, phase: 'lobby', seats: [], gen: 0, dead: false, timers: new Set(), faults: 0,
       battle: null, camp: null, campPhase: null, queue: [], fight: null, hurry: null,
       paused: false, pauseSeq: 0, resumeTimer: null, lastActive: Date.now(),
     };
@@ -169,11 +197,11 @@ export function createGameServer(options = {}) {
   // went / came; hold = how long the current absence may last; spends = it counts against grace.
   const humanSeat = (ws, name) => ({
     name, token: crypto.randomBytes(18).toString('base64url'), ws, ready: false, bot: false,
-    lostAt: 0, backAt: Date.now(), grace: cfg.graceMs, hold: 0, spends: false, graceTimer: null, owedEnd: false,
+    lostAt: 0, backAt: Date.now(), grace: cfg.graceMs, hold: 0, spends: false, graceTimer: null, owedEnd: null,
   });
   const botSeat = () => ({
     name: BOT_NAME, token: null, ws: null, ready: true, bot: true,
-    lostAt: 0, backAt: 0, grace: 0, hold: 0, spends: false, graceTimer: null, owedEnd: false,
+    lostAt: 0, backAt: 0, grace: 0, hold: 0, spends: false, graceTimer: null, owedEnd: null,
   });
 
   const isLost = seat => !seat.bot && !seat.ws;
@@ -184,7 +212,7 @@ export function createGameServer(options = {}) {
     seat.ws = ws; ws.room = room; ws.seat = seat;
     room.lastActive = Date.now();
   }
-  function unseat(ws) { ws.room = null; ws.seat = null; }
+  function unseat(ws) { ws.room = null; ws.seat = null; ws.lastMsgAt = Date.now(); }
 
   function roomView(room, i) {
     const players = room.seats.map(s => {
@@ -229,13 +257,15 @@ export function createGameServer(options = {}) {
     }, cfg.resumeDelayMs);
   }
 
-  // The socket of a seat went away (any phase): hold the seat. In a running game for what is left
-  // of its grace, otherwise for graceMs.
+  // The socket of a seat went away (any phase): hold the seat. In a running game against another human
+  // for what is left of its grace (nobody else is kept waiting otherwise: practice rooms never spend
+  // it), else for graceMs.
   function seatLost(room, seat) {
     const now = Date.now(), running = RUNNING.has(room.phase);
+    const metered = running && room.seats.some(s => s !== seat && !s.bot);
     seat.grace = Math.min(cfg.graceMs, seat.grace + Math.max(0, now - seat.backAt) * cfg.graceRefill);
-    seat.hold = running ? seat.grace : cfg.graceMs;
-    seat.spends = running;
+    seat.hold = metered ? seat.grace : cfg.graceMs;
+    seat.spends = metered;
     seat.ws = null; seat.lostAt = now;
     if (!running) seat.ready = false;
     pause(room);
@@ -253,9 +283,10 @@ export function createGameServer(options = {}) {
   function syncSeat(room, seat) {
     const i = room.seats.indexOf(seat), ws = seat.ws;
     send(ws, roomView(room, i));
-    if (seat.owedEnd) {   // the opponent forfeited while this seat was away
-      seat.owedEnd = false;
-      send(ws, { t: 'end', winner: i, reason: 'forfeit', forfeit: true });
+    if (seat.owedEnd) {   // a result this seat may have missed: the opponent forfeited, or the battle ended
+      const { own, ...end } = seat.owedEnd;
+      seat.owedEnd = null;
+      send(ws, own ? { ...end, winner: i } : end);   // own: the forfeit winner is this seat, as numbered now
     }
     if (room.camp) send(ws, campView(room, i));
     if (room.phase === 'battle' && room.battle) {
@@ -274,13 +305,15 @@ export function createGameServer(options = {}) {
     room.seats.splice(idx, 1);
     const stay = room.seats.find(s => !s.bot);
     if (!stay) return destroyRoom(room);
+    let owed = null;
     if (RUNNING.has(room.phase)) {
       // The winner is named by the seat index they played under; the fresh 'room' follows.
-      if (stay.ws) send(stay.ws, { t: 'end', winner: 1 - idx, reason: 'forfeit', forfeit: true });
-      else stay.owedEnd = true;
+      const end = { t: 'end', winner: 1 - idx, reason: 'forfeit', forfeit: true };
+      if (stay.ws) send(stay.ws, end); else owed = { ...end, own: true };   // the reset below renumbers the seat
     }
     if (room.phase === 'lobby') { if (!anyLost(room)) unpause(room); broadcastRoom(room); }
     else resetToLobby(room);
+    if (owed) stay.owedEnd = owed;   // after the reset, which clears stale debts
   }
 
   // Discard the game (if any); the humans that are left wait in the lobby from seat 0.
@@ -289,7 +322,7 @@ export function createGameServer(options = {}) {
     clearGame(room);
     room.faults = 0;
     room.seats = room.seats.filter(s => !s.bot);
-    for (const s of room.seats) s.ready = false;
+    for (const s of room.seats) { s.ready = false; s.owedEnd = null; }
     room.phase = 'lobby';
     if (!anyLost(room)) unpause(room);
     broadcastRoom(room);
@@ -322,7 +355,7 @@ export function createGameServer(options = {}) {
     room.battle = null; room.fight = null; room.queue = [];
     for (const s of room.seats) s.ready = s.bot;
     if (!wasRunning) return broadcastRoom(room);
-    if (wasBattle) broadcast(room, { t: 'end', winner: -1, reason: 'timeout' });
+    if (wasBattle) announceEnd(room, { t: 'end', winner: -1, reason: 'timeout' });
     room.phase = 'over';
     if (room.camp) {
       room.camp.winner = -1; room.campPhase = 'over';
@@ -333,25 +366,25 @@ export function createGameServer(options = {}) {
 
   // ---------- lobby ----------
 
-  // At capacity a room that nobody is connected to gives way to a new one. Without this, one
-  // address could fill the server by creating rooms and hanging up (each is held for its grace).
-  // Rooms without a running game go first, then the one whose players have been away longest.
-  function evictAbandoned() {
-    let pick = null, best = Infinity;
-    for (const room of rooms.values()) {
-      const humans = room.seats.filter(s => !s.bot);
-      if (humans.some(s => s.ws)) continue;
-      const since = Math.min(...humans.map(s => s.lostAt)) + (RUNNING.has(room.phase) ? cfg.graceMs : 0);
-      if (!pick || since < best) { pick = room; best = since; }
-    }
-    if (pick) destroyRoom(pick);
-    return !!pick;
+  // One address may keep at most MAX_ABANDONED_PER_IP rooms that no human is connected to (each is held
+  // for its grace period). Creating another one gives up that address's own oldest. A room is never
+  // destroyed because of somebody else's create: at capacity the answer is server_full (SPEC 7.2).
+  const abandoned = room => !room.seats.some(s => !s.bot && s.ws);
+  const awaySince = room => Math.min(...room.seats.filter(s => !s.bot).map(s => s.lostAt));
+  function trimAbandoned(ip) {
+    const mine = [];
+    for (const room of rooms.values()) if (room.ip === ip && abandoned(room)) mine.push(room);
+    if (mine.length < MAX_ABANDONED_PER_IP) return;
+    let oldest = mine[0];
+    for (const room of mine) if (awaySince(room) < awaySince(oldest)) oldest = room;
+    destroyRoom(oldest);
   }
 
   function onCreate(ws, m, withBot) {
     if (ws.room) return;
-    if (rooms.size >= cfg.maxRooms && !evictAbandoned()) return send(ws, ERRORS.full);
-    const room = newRoom(m.mode === 'campaign' ? 'campaign' : 'battle');
+    trimAbandoned(ws.ip);
+    if (rooms.size >= cfg.maxRooms) return send(ws, ERRORS.full);
+    const room = newRoom(m.mode === 'campaign' ? 'campaign' : 'battle', ws.ip);
     const seat = humanSeat(ws, cleanName(m.name));
     room.seats.push(seat);
     attach(room, seat, ws);
@@ -359,12 +392,17 @@ export function createGameServer(options = {}) {
     broadcastRoom(room);
   }
 
+  // Room codes are only 4 characters: an address that keeps missing is answered 'rate' without a lookup.
   function onJoin(ws, m) {
     if (ws.room) return;
+    if (joinFails.blocked(ws.ip)) return send(ws, ERRORS.rate);
     const code = cleanCode(m.code);
     if (code === null) return;
     const room = rooms.get(code);
-    if (!room || room.phase !== 'lobby' || room.seats.length >= 2) return send(ws, ERRORS.badRoom);
+    if (!room || room.phase !== 'lobby' || room.seats.length >= 2) {
+      joinFails.fail(ws.ip);
+      return send(ws, ERRORS.badRoom);
+    }
     const seat = humanSeat(ws, cleanName(m.name));
     room.seats.push(seat);
     attach(room, seat, ws);
@@ -426,6 +464,7 @@ export function createGameServer(options = {}) {
   function onReady(room, me) {
     if (room.phase !== 'lobby' && room.phase !== 'over') return;
     room.seats[me].ready = true;
+    room.seats[me].owedEnd = null;   // ready for a rematch: this seat has seen the result
     const go = room.seats.length === 2 && room.seats.every(s => s.ready) && !anyLost(room);
     if (go) startGame(room); else broadcastRoom(room);
   }
@@ -434,6 +473,7 @@ export function createGameServer(options = {}) {
     bumpGen(room);
     clearGame(room);
     room.faults = 0;
+    for (const s of room.seats) s.owedEnd = null;
     if (room.mode === 'campaign') {
       room.camp = C.newCampaign(); room.campPhase = 'orders'; room.phase = 'campaign';
     } else {
@@ -447,7 +487,9 @@ export function createGameServer(options = {}) {
 
   const makeBattle = (armies, defender) => createBattle(armies, { timeLimit: cfg.battleTimeLimit, defender });
   const battleLimit = battle => (Number.isFinite(battle.timeLimit) ? battle.timeLimit : cfg.battleTimeLimit);
-  const startMsg = (room, i) => ({ t: 'start', you: i, W, H, types: TYPES, limit: battleLimit(room.battle) });
+  // startMen: regiment id (as a string) -> men at the start of this battle, for both sides (SPEC 2.2).
+  const startMen = battle => Object.fromEntries(battle.regs.map(r => [String(r.id), r.startMen]));
+  const startMsg = (room, i) => ({ t: 'start', you: i, W, H, types: TYPES, limit: battleLimit(room.battle), startMen: startMen(room.battle) });
   // A battle that starts paused (a seat is away) comes with one snapshot, so that whoever is
   // present sees the armies while waiting instead of an empty field.
   function announceBattle(room) {
@@ -472,10 +514,19 @@ export function createGameServer(options = {}) {
     if (b.over) endBattle(room);
   }
 
+  // The result of a battle goes to everyone connected. Outside a campaign (whose views carry the result)
+  // every human is also owed it until it was sent again on a rejoin: the end may have gone into a socket
+  // that was already dead, or reach a seat that is away (SPEC 7.3).
+  function announceEnd(room, end) {
+    broadcast(room, end);
+    if (room.camp) return;
+    for (const s of room.seats) if (!s.bot) s.owedEnd = end;
+  }
+
   function endBattle(room) {
     const b = room.battle;
     const winner = b.winner === 0 || b.winner === 1 ? b.winner : -1;
-    broadcast(room, { t: 'end', winner, reason: b.reason === 'timeout' ? 'timeout' : 'rout' });
+    announceEnd(room, { t: 'end', winner, reason: b.reason === 'timeout' ? 'timeout' : 'rout' });
     if (room.camp) {
       room.phase = 'between';
       later(room, cfg.betweenMs, () => afterCampaignBattle(room, winner));
@@ -546,8 +597,9 @@ export function createGameServer(options = {}) {
     const o = campaignOrder(m);
     if (!o) return;
     if (o.t === 'endturn') return endTurnFor(room, me);
-    const ok = o.t === 'recruit' ? C.recruit(c, me, o.prov, o.type) : C.setMove(c, me, o.army, o.to);
-    if (ok) sendCamp(room);
+    // true only when something changed: an order that changes nothing costs no broadcast (SPEC 5)
+    const changed = o.t === 'recruit' ? C.recruit(c, me, o.prov, o.type) : C.setMove(c, me, o.army, o.to);
+    if (changed) sendCamp(room);
   }
 
   function endTurnFor(room, who) {
@@ -640,12 +692,27 @@ export function createGameServer(options = {}) {
 
   // ---------- connections ----------
 
-  // Over a limit: say so with close code 1013, and do not wait long for the other side to hang up.
-  function refuse(ws) {
-    ws.close(1013, 'Server busy');
+  // Close with a code, and do not wait long for the other side to answer the close frame.
+  function closeWith(ws, code, reason) {
+    try { ws.close(code, reason); } catch { /* already closing */ }
     const timer = setTimeout(() => ws.terminate(), REFUSE_LINGER_MS);
     timer.unref();
     ws.once('close', () => clearTimeout(timer));
+  }
+  // Over a limit: say so with close code 1013.
+  const refuse = ws => closeWith(ws, 1013, 'Server busy');
+
+  // Once, on the first connection that came through a proxy: show what the address logic made of it, so a
+  // wrong TRUST_PROXY_HOPS is noticed on the first visit rather than when real players hit the per-address cap.
+  function noteProxy(req, ip) {
+    const header = req?.headers?.['x-forwarded-for'];
+    if (proxyNoted || header === undefined) return;
+    proxyNoted = true;
+    const raw = String(Array.isArray(header) ? header.join(', ') : header).replace(/[^\x20-\x7e]/g, '?').slice(0, 200);
+    const text = cfg.trustProxy
+      ? `[legio] proxy check: X-Forwarded-For "${raw}", ${cfg.trustProxy} trusted hop(s), counted as client ${ip}. Every player should show up as a different client; if all show the proxy's address, raise TRUST_PROXY_HOPS.`
+      : `[legio] X-Forwarded-For "${raw}" is present but TRUST_PROXY_HOPS is 0: everyone behind the proxy counts as one client. Set TRUST_PROXY_HOPS to the number of proxies in front of this server.`;
+    try { cfg.log(text); } catch { /* a broken logger must not matter */ }
   }
 
   function onConnection(ws, req) {
@@ -653,7 +720,8 @@ export function createGameServer(options = {}) {
     const ip = clientIp(req, cfg.trustProxy);
     if (stopped || conns.size >= cfg.maxConnections || !ips.add(ip)) return refuse(ws);
     conns.add(ws);
-    ws.ip = ip; ws.room = null; ws.seat = null; ws.alive = true; ws.dropped = 0; ws.warnedAt = 0;
+    noteProxy(req, ip);
+    ws.ip = ip; ws.room = null; ws.seat = null; ws.alive = true; ws.dropped = 0; ws.warnedAt = 0; ws.lastMsgAt = Date.now();
     ws.bucket = createTokenBucket(cfg.rate.capacity, cfg.rate.refillPerSec);
     ws.on('pong', () => { ws.alive = true; });
     ws.on('message', (data, isBinary) => {
@@ -687,6 +755,7 @@ export function createGameServer(options = {}) {
     const m = parseFrame(data, isBinary);
     if (!m) return;
     if (m.t === 'ping') return send(ws, { t: 'pong', n: Number.isFinite(m.n) ? m.n : undefined });
+    ws.lastMsgAt = Date.now();
     if (ws.room) ws.room.lastActive = Date.now();
     switch (m.t) {
       case 'create': return onCreate(ws, m, false);
@@ -722,15 +791,21 @@ export function createGameServer(options = {}) {
       try { ws.ping(); } catch { /* closing */ }
     }
   }
+  // Idle rooms are closed. So are sockets that sit in no room and say nothing but ping: they only hold a
+  // connection slot. (A socket in a room is the room's business: idle expiry and the heartbeat.)
   function sweepIdle() {
-    const cutoff = Date.now() - cfg.idleRoomMs;
+    const now = Date.now(), cutoff = now - cfg.idleRoomMs, unseatedCutoff = now - cfg.unseatedIdleMs;
     for (const room of rooms.values()) if (room.lastActive < cutoff) destroyRoom(room, 'idle');
+    for (const ws of conns) {
+      if (!ws.room && ws.readyState === 1 && ws.lastMsgAt < unseatedCutoff) closeWith(ws, 1008, 'Idle');
+    }
+    joinFails.prune();
   }
   const safely = (what, fn) => () => { try { fn(); } catch (err) { report(what, err); } };
 
   function startLoops() {
     if (stopped || loops.length) return;
-    const sweepMs = Math.max(10, Math.min(30000, cfg.idleRoomMs / 4));
+    const sweepMs = Math.max(10, Math.min(30000, cfg.idleRoomMs / 4, cfg.unseatedIdleMs / 4));
     loops = [
       setInterval(safely('battle tick', tickAll), cfg.tickMs),
       setInterval(safely('heartbeat', heartbeat), cfg.heartbeatMs),
@@ -786,8 +861,8 @@ export function createGameServer(options = {}) {
     return closing;
   }
 
-  // _rooms is for the test suite only (fault injection); nothing remote can reach it.
-  return { httpServer, listen, close, stats, _rooms: rooms };
+  // _rooms and _conns are for the test suite only (fault injection); nothing remote can reach them.
+  return { httpServer, listen, close, stats, _rooms: rooms, _conns: conns };
 }
 
 // ---------- run directly: node server.js ----------
@@ -799,16 +874,10 @@ function isMain() {
   return urls.includes(import.meta.url);
 }
 
-// TRUST_PROXY overrides which X-Forwarded-For hop is believed: 'false', 'true' (first hop, the
-// default on Render) or N = the Nth hop from the right, for N proxies of our own in front.
-function trustProxyFromEnv() {
-  const v = String(process.env.TRUST_PROXY ?? '').trim().toLowerCase();
-  if (v === 'true' || v === 'false') return v === 'true';
-  return /^[0-9]{1,2}$/.test(v) ? Number(v) : undefined;
-}
-
+// Environment (read by createGameServer when the option is not given): TRUST_PROXY_HOPS = proxies of our
+// own in front (default 1 on Render, else 0), MAX_ROOMS, MAX_CONNECTIONS, MAX_PER_IP.
 function main() {
-  const game = createGameServer({ trustProxy: trustProxyFromEnv() });
+  const game = createGameServer();
   // Last line of defence: log and keep serving the other rooms.
   process.on('uncaughtException', err => console.error('[legio] uncaught exception:', err));
   process.on('unhandledRejection', err => console.error('[legio] unhandled rejection:', err));

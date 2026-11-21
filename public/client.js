@@ -19,6 +19,10 @@ var LegioClient = (function () {
   const ATTEMPT_MS = 20000;                 // a handshake that hangs this long is abandoned
   const WAKE_NOTE_MS = 3000;
   const PING_MS = 20000, HEALTH_MS = 240000;
+  const FULL_RETRY_MS = 10000;              // server full (close 1013): fixed, patient retry
+  const FULL_TEXT = 'Server is full, retrying...';
+  // live-battle link watchdog (see watchLink)
+  const WATCH_MS = 1000, WATCH_PING_MS = 2000, NO_SIGNAL_MS = 3500, DEAD_LINK_MS = 6000;
   const REJOIN_WAIT_MS = 8000, LEAVE_WAIT_MS = 3000, SHUTDOWN_WAIT_MS = 5000;
   const HUD_SPACE = 52;                     // px kept free above the field for the HUD
   const HIT_RADIUS = 28, LINE_DRAG_MIN = 30, FIELD_MARGIN = 10;
@@ -73,16 +77,17 @@ var LegioClient = (function () {
   let rejoining = false, rejoinTimer = 0;
   let leaving = null, leaveTimer = 0;       // {code} between sending `leave` and the reply
   let endShown = false, endLeave = false;
+  let resultDismissed = false;   // "Return to lobby" was clicked for the finished game of this room
   let helpOpen = false;
   let flashText = '', flashTimer = 0;
   let loopOn = false, drawFailed = false;
 
   const conn = { ws: null, state: 'connecting', everOpen: false, attempt: 0, lostAt: 0, waking: false,
-    full: false, notice: '', lastRx: 0, pingAt: 0, retryTimer: 0, giveUpTimer: 0, attemptTimer: 0, noticeTimer: 0 };
+    full: false, stale: false, prev: null, notice: '', lastRx: 0, pingAt: 0, watchPingAt: 0, retryTimer: 0, giveUpTimer: 0, attemptTimer: 0, noticeTimer: 0 };
   const peer = { lost: false, until: 0, timer: 0 };
   const battle = { live: false, W: 1600, H: 900, types: {}, limit: 0, time: 0, left: null,
     regs: [], byId: new Map(), prevById: new Map(), snapAt: 0, prevAt: 0, startMen: new Map(),
-    simAt: 0, moving: false, held: [], pauseNote: false };
+    simAt: 0, moving: false, held: [], pauseNote: '' };
   const selected = new Set();
   const view = { scale: 1, ox: 0, oy: 0, dpr: 1 };
   const pointer = { x: 0, y: 0, box: null, line: null };
@@ -153,11 +158,16 @@ var LegioClient = (function () {
     conn.giveUpTimer = setTimeout(giveUp, GIVE_UP_MS);
   }
 
+  // An accepted handshake is not yet proof of a working server: a full server accepts and then closes
+  // with 1013. So the outage books are kept in conn.prev until the first frame arrives (onFrame), and
+  // a 1013 close restores them (onClosed). conn.full also stays set until then (no banner flicker).
   function onOpen() {
+    conn.prev = { attempt: conn.attempt, lostAt: conn.lostAt };
     conn.state = 'open'; conn.everOpen = true; conn.attempt = 0; conn.lostAt = 0;
-    conn.waking = false; conn.full = false; conn.notice = '';
+    conn.waking = false; conn.stale = false; conn.notice = '';
     conn.lastRx = Date.now(); conn.pingAt = 0;
     clearTimeout(conn.giveUpTimer); clearTimeout(conn.attemptTimer);
+    send({ t: 'ping' });   // a page without a seat gets its first frame (the proof) right away
     if (seat) startRejoin();
     else if (room || screen !== 'menu') localLeave('The connection was lost and the game could not be resumed.');
     renderBanner(); renderMenu();
@@ -171,10 +181,22 @@ var LegioClient = (function () {
     if (conn.state === 'dead') return;
     // 4000 = the server moved our seat to a newer socket (another tab): do not fight over it
     if (code === 4000 && (seat || room)) localLeave('This game was taken over by another tab or window.');
-    conn.full = code === 1013;
+    // 1013 = server full. Being accepted only to be refused is no success: the retry count and the
+    // give-up clock carry on from before the handshake, and the retry is a fixed, patient 10 s.
+    const refused = code === 1013;
+    if (refused && conn.prev) {
+      conn.attempt = conn.prev.attempt;
+      conn.lostAt = conn.prev.lostAt;
+      if (conn.lostAt) {
+        clearTimeout(conn.giveUpTimer);
+        conn.giveUpTimer = setTimeout(giveUp, Math.max(0, GIVE_UP_MS - (Date.now() - conn.lostAt)));
+      }
+    }
+    conn.prev = null;
+    conn.full = refused;
     conn.state = conn.everOpen ? 'lost' : 'connecting';
     beginOutage();
-    conn.retryTimer = setTimeout(connect, RETRY_MS[Math.min(conn.attempt, RETRY_MS.length - 1)]);
+    conn.retryTimer = setTimeout(connect, refused ? FULL_RETRY_MS : RETRY_MS[Math.min(conn.attempt, RETRY_MS.length - 1)]);
     conn.attempt++;
     cancelPointer();
     renderBanner(); renderMenu();
@@ -189,8 +211,9 @@ var LegioClient = (function () {
   }
 
   // The link looks dead (no answer to our ping, or a leave that got no reply): start over.
-  function forceReconnect() {
+  function forceReconnect(noSignal) {
     if (conn.state !== 'open') return;
+    conn.stale = noSignal === true;   // only for the banner text; onOpen clears it
     dropSocket();
     onClosed(0);
   }
@@ -213,6 +236,19 @@ var LegioClient = (function () {
     if (conn.pingAt && conn.lastRx < conn.pingAt) return forceReconnect();
     conn.pingAt = Date.now();
     send({ t: 'ping' });
+  }
+
+  // During a live battle snapshots arrive 20 times a second, so a silent socket is suspicious long before
+  // the 20 s ping cycle notices. The server answers pings even while the game is paused, so a pong
+  // proves the link, and no frame at all for DEAD_LINK_MS means it is dead.
+  function watchLink() {
+    if (conn.state !== 'open' || !battle.live || screen !== 'battle') return;
+    const now = Date.now(), quiet = now - conn.lastRx;
+    if (quiet > DEAD_LINK_MS) return forceReconnect(true);
+    if (quiet > WATCH_PING_MS && now - conn.watchPingAt >= WATCH_PING_MS) {
+      conn.watchPingAt = now;
+      send({ t: 'ping' });
+    }
   }
 
   // Free hosting sleeps without HTTP traffic, even while WebSockets are busy.
@@ -240,6 +276,7 @@ var LegioClient = (function () {
   // ---------- incoming messages ----------
   function onFrame(data) {
     conn.lastRx = Date.now();
+    if (conn.prev || conn.full) { conn.prev = null; conn.full = false; renderBanner(); }   // the server really took us
     if (typeof data !== 'string') return;
     let m;
     try { m = JSON.parse(data); } catch (e) { return; }
@@ -269,6 +306,7 @@ var LegioClient = (function () {
     }
     const resync = rejoining;
     endRejoin();
+    if (!room || room.code !== m.code || m.phase !== 'over') resultDismissed = false;
     if (!room || room.code !== m.code) forgetGame();
     room = m;
     me = m.you === 1 ? 1 : 0;
@@ -287,6 +325,7 @@ var LegioClient = (function () {
   function onStart(m) {
     if (leaving) return;
     me = m.you === 1 ? 1 : 0;
+    resultDismissed = false;
     beginBattle(m);
     hideEnd();
     setScreen('battle');
@@ -327,6 +366,8 @@ var LegioClient = (function () {
 
   function onEnd(m) {
     if (leaving || !room) return;
+    if (resultDismissed && !battle.live) return;   // a replay of a result the player already acknowledged
+    const idleView = screen === 'room' || screen === 'menu';   // a rejoin into a finished game: no battle on screen
     const forfeit = m.reason === 'forfeit' || m.forfeit === true;
     const campaignBattle = inCampaign();
     battle.live = false;
@@ -340,7 +381,7 @@ var LegioClient = (function () {
     let sub = won ? 'The enemy army broke' : draw ? 'Both armies broke' : 'Your army broke';
     if (forfeit) sub = 'Your opponent left';
     else if (m.reason === 'timeout') sub = 'Time expired';
-    const leave = forfeit || !campaignBattle;
+    const leave = forfeit || !campaignBattle || idleView;
     showEndOverlay(title, leave ? sub : sub + '. Returning to the campaign map...', { leave });
   }
 
@@ -349,6 +390,8 @@ var LegioClient = (function () {
     if (m.you === 0 || m.you === 1) me = m.you;
     campSeen = true;
     const over = m.winner === 0 || m.winner === 1 || m.winner === -1;
+    // The player already dismissed this result and sits in the room view: a rejoin must not pull them back.
+    if (over && resultDismissed && screen === 'room') return;
     // A campaign view that only repeats "a battle is being fought" must not hide that battle.
     const keepBattle = battle.live && screen === 'battle' && m.phase === 'battle' && !over;
     if (!keepBattle) {
@@ -413,6 +456,7 @@ var LegioClient = (function () {
   function localLeave(msg) {
     saveSeat(null);
     room = null;
+    resultDismissed = false;
     endRejoin();
     flashText = '';
     forgetGame();
@@ -428,6 +472,12 @@ var LegioClient = (function () {
     syncPeer(room);
     setScreen('room');
     renderRoom();
+  }
+
+  // The "Return to lobby" button: remember that the finished game's result was acknowledged.
+  function returnToLobby() {
+    if (room && (room.phase === 'over' || (endShown && endLeave))) resultDismissed = true;
+    backToRoom();
   }
 
   // Leave the room now. Callers confirm first when that means a forfeit.
@@ -541,12 +591,13 @@ var LegioClient = (function () {
       return { text: conn.everOpen ? 'Could not reconnect.' : 'Could not reach the server.', reload: true };
     }
     if (conn.state === 'lost') {
-      return { text: conn.full ? 'The server is full. Retrying...' : 'Connection lost. Reconnecting...' };
+      return { text: conn.full ? FULL_TEXT : conn.stale ? 'Connection looks dead. Reconnecting...' : 'Connection lost. Reconnecting...' };
     }
     if (conn.state === 'connecting') {
-      if (conn.full) return { text: 'The server is full. Retrying...' };
+      if (conn.full) return { text: FULL_TEXT };
       return conn.waking ? { text: 'Waking the server. This can take up to a minute on free hosting.' } : null;
     }
+    if (conn.full) return { text: FULL_TEXT };   // accepted, but not yet heard from: a refusal may follow
     if (conn.notice) return { text: conn.notice };
     if (peer.lost && room) {
       const left = Math.max(0, Math.ceil((peer.until - Date.now()) / 1000));
@@ -622,7 +673,7 @@ var LegioClient = (function () {
     battle.regs = []; battle.byId = new Map(); battle.prevById = new Map();
     battle.startMen.clear();
     battle.time = 0; battle.left = null;
-    battle.simAt = 0; battle.moving = false; battle.held = []; battle.pauseNote = false;
+    battle.simAt = 0; battle.moving = false; battle.held = []; battle.pauseNote = '';
     selected.clear();
     cancelPointer();
     fx = [];
@@ -636,6 +687,14 @@ var LegioClient = (function () {
     battle.H = isNum(m.H) && m.H >= 100 && m.H <= FAR ? m.H : 900;
     battle.types = m.types && typeof m.types === 'object' ? m.types : {};
     battle.limit = isNum(m.limit) ? clamp(m.limit, 0, 86400) : 0;
+    // The server states the men at battle start (also after a rejoin); without it the first snapshot
+    // seen is the best guess (see onSnap).
+    const sm = m.startMen;
+    if (sm && typeof sm === 'object' && !Array.isArray(sm)) {
+      for (const key of Object.keys(sm)) {
+        if (/^\d{1,9}$/.test(key) && Number.isInteger(sm[key]) && sm[key] > 0) battle.startMen.set(Number(key), Math.min(sm[key], MAX_MEN));
+      }
+    }
   }
 
   function pruneSelection() {
@@ -790,8 +849,9 @@ var LegioClient = (function () {
     const regs = selectedRegs();
     if (screen !== 'battle' || !battle.live || !regs.length) return;
     if (lineLength(l) > LINE_DRAG_MIN) return orderLine(regs, { x: l.x0, y: l.y0 }, { x: l.x1, y: l.y1 });
-    // enemies first: an enemy under the cursor wins over a nearer friendly regiment
-    const foe = regimentAt(l.x0, l.y0, r => !isMine(r));
+    // enemies first: a live enemy under the cursor wins over a nearer friendly regiment. A routing or
+    // dead one cannot be attacked (the server drops that order), so a click there is a plain move.
+    const foe = regimentAt(l.x0, l.y0, r => !isMine(r) && fit(r));
     if (foe) orderAttack(regs, foe); else orderMove(regs, l.x0, l.y0);
   }
 
@@ -850,7 +910,7 @@ var LegioClient = (function () {
     if (left === null && !known && battle.limit > 0) left = Math.ceil(battle.limit);
     const clock = $('hudClock');
     if (clock) {
-      setText('hudClock', (left === null ? '--:--' : clockText(left)) + (battle.pauseNote ? ' (paused)' : ''));
+      setText('hudClock', (left === null ? '--:--' : clockText(left)) + (battle.pauseNote ? ` (${battle.pauseNote})` : ''));
       clock.style.color = left !== null && left < 30 ? '#ff5a4d' : '';
       clock.style.fontWeight = left !== null && left < 30 ? 'bold' : '';
     }
@@ -969,8 +1029,10 @@ var LegioClient = (function () {
     ctx.beginPath(); ctx.moveTo(battle.W / 2, 0); ctx.lineTo(battle.W / 2, battle.H); ctx.stroke();
     ctx.setLineDash([]);
     if (!battle.regs.length) return;
-    const paused = battle.live && ticks() - battle.simAt > PAUSE_NOTE_MS;
-    if (paused !== battle.pauseNote) { battle.pauseNote = paused; updateHud(); }
+    // "paused" is only honest while frames (pongs, peer notices) still arrive; a silent link is no pause
+    const note = !battle.live ? '' : Date.now() - conn.lastRx > NO_SIGNAL_MS ? 'no signal'
+      : ticks() - battle.simAt > PAUSE_NOTE_MS ? 'paused' : '';
+    if (note !== battle.pauseNote) { battle.pauseNote = note; updateHud(); }
     placeRegiments();
     drawMarks(ctx);
     for (const r of battle.regs) if (r.state !== 'dead') drawRegiment(ctx, r);
@@ -1054,7 +1116,7 @@ var LegioClient = (function () {
     }
     if (l && lineLength(l) > LINE_DRAG_MIN) return drawLinePreview(ctx, l);
     if (b || l || !battle.live || !selected.size) return;
-    const foe = regimentAt(pointer.x, pointer.y, r => !isMine(r));   // what a right-click would attack
+    const foe = regimentAt(pointer.x, pointer.y, r => !isMine(r) && fit(r));   // what a right-click would attack
     if (!foe) return;
     ctx.strokeStyle = '#ff5a4d'; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.arc(foe.dx, foe.dy, 28, 0, 7); ctx.stroke();
@@ -1109,7 +1171,7 @@ var LegioClient = (function () {
     listen('btnLeave', 'click', leaveRoom);
     listen('btnForget', 'click', leaveRoom);
     listen('btnQuit', 'click', quitGame);
-    listen('btnAgain', 'click', backToRoom);
+    listen('btnAgain', 'click', returnToLobby);
     listen('btnHelp', 'click', () => setHelp(true));
     listen('btnHowTo', 'click', () => setHelp(true));
     listen('btnHelpClose', 'click', () => setHelp(false));
@@ -1134,6 +1196,7 @@ var LegioClient = (function () {
     if (el && typeof name === 'string' && !el.value) el.value = name.slice(0, 16);
     setScreen('menu');
     setInterval(keepAlive, PING_MS);
+    setInterval(watchLink, WATCH_MS);
     setInterval(keepAwake, HEALTH_MS);
     setTimeout(() => {
       if (conn.everOpen) return;
@@ -1145,7 +1208,7 @@ var LegioClient = (function () {
   }
 
   boot();
-  return { send, leaveRoom, showEndOverlay, mySeat: () => me };
+  return { send, leaveRoom, showEndOverlay, mySeat: () => me, peerAway: () => peer.lost && !!room };
 })();
 
 // ---------- shared contract with campaign.js (SPEC 8.1) ----------
@@ -1153,3 +1216,4 @@ function send(obj) { return LegioClient.send(obj); }
 function leaveRoom() { LegioClient.leaveRoom(); }
 function showEndOverlay(title, sub, opts) { LegioClient.showEndOverlay(title, sub, opts); }
 function mySeat() { return LegioClient.mySeat(); }
+function peerAway() { return LegioClient.peerAway(); }   // the opponent is disconnected (campaign.js freezes its countdown)

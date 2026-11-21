@@ -5,6 +5,7 @@
 (() => {
   'use strict';
 
+  const QUIT_GUARD_MS = 400;
   const SIDE = [['#b3262a', 'Red'], ['#2a4f9b', 'Blue']];
   const NEUTRAL = '#6e6a5c';
   const FALLBACK_NAME = { sword: 'Shortsword Infantry', spear: 'Spear Phalanx', archer: 'Archers', cav: 'Heavy Cavalry' };
@@ -24,8 +25,10 @@
   let view = null;         // last camp view, normalised
   let sel = null;          // selected province index
   let quitArmed = false;   // "Quit campaign" was clicked, waiting for the confirmation
+  let quitArmedAt = 0;     // when (ms): "Yes, quit" ignores clicks right after, so a double-click cannot pass it
   let timer = null;        // the one countdown interval
   let deadlineEnd = 0;     // local clock (ms) at which the hurry-up deadline runs out
+  let frozenMs = null;     // time left (ms) while the opponent is disconnected: the server stops its timer then
   const drawn = { map: null, panel: null };   // HTML last written, to skip no-op redraws
   const bound = { map: null, panel: null };   // elements that already carry our click listener
 
@@ -188,8 +191,10 @@
     const held = o < 0 ? 'Unclaimed' : `Held by ${SIDE[o][1]}${o === me ? ' (you)' : ''}`;
     const capOf = [0, 1].find(s => v.capital[s] === sel);
     let h = `<h2>${esc(v.provs[sel].name)}</h2><div>${held}${capOf === undefined ? '' : ` &middot; ${SIDE[capOf][1]} capital`}</div>`;
-    for (const a of armiesAt(v, sel)) h += armyHtml(v, a, orders);
+    // The recruit buttons come first: a recruit adds rows to the army list, and nothing above a button
+    // may change height, or the next click (pointer unmoved) would land on another unit type.
     if (o === me && orders) h += recruitHtml(v);
+    for (const a of armiesAt(v, sel)) h += armyHtml(v, a, orders);
     return h;
   }
 
@@ -243,7 +248,7 @@
     return '<div class="camp-rules"><b>Rules</b><ul>' +
       `<li>Units regain ${pct}% strength per turn in friendly provinces.</li>` +
       '<li>Survivors regroup after a battle.</li>' +
-      '<li>The province owner defends, and the defender holds if a battle runs out of time.</li>' +
+      '<li>The province owner defends. If a battle runs out of time, the army with more men left wins, and the defender gets a 25% edge.</li>' +
       '<li>Armies that cross paths turn back.</li>' +
       '<li>Take the enemy capital to win.</li></ul></div>';
   }
@@ -296,22 +301,38 @@
   function stopTimer() {
     if (timer !== null) clearInterval(timer);
     timer = null;
+    frozenMs = null;
   }
 
   function syncDeadline() {
     if (!view || !view.deadline) return stopTimer();
     deadlineEnd = Date.now() + view.deadline.left * 1000;
+    frozenMs = null;
     if (timer === null) timer = setInterval(paintDeadline, 250);
+  }
+
+  // client.js knows whether the opponent is disconnected (the room is paused, the server's hurry-up
+  // timer stands still): then the shown time stands still too.
+  function opponentAway() {
+    try { return typeof peerAway === 'function' && peerAway() === true; } catch (e) { return false; }
   }
 
   function paintDeadline() {
     if (!view || !view.deadline) return stopTimer();
+    const now = Date.now();
+    if (opponentAway()) {
+      if (frozenMs === null) frozenMs = Math.max(0, deadlineEnd - now);
+    } else if (frozenMs !== null) {
+      deadlineEnd = now + frozenMs;   // resume from where it stood
+      frozenMs = null;
+    }
     const el = $('campDeadline');
     if (!el) return;
-    const left = Math.max(0, Math.ceil((deadlineEnd - Date.now()) / 1000));
+    const left = Math.max(0, Math.ceil((frozenMs !== null ? frozenMs : deadlineEnd - now) / 1000));
+    const note = frozenMs !== null ? ' (paused)' : '';
     el.textContent = view.deadline.who === view.you
-      ? `Opponent is waiting: ${left} s to end your turn`
-      : `Waiting for opponent: ${left} s`;
+      ? `Opponent is waiting: ${left} s to end your turn${note}`
+      : `Waiting for opponent: ${left} s${note}`;
   }
 
   // ---------- input ----------
@@ -353,8 +374,8 @@
     if (act === 'recruit') recruit(intAttr(b, 'data-i'));
     else if (act === 'cancel') cancelMarch();
     else if (act === 'end') { if (canOrder(view)) send({ t: 'endturn' }); }
-    else if (act === 'quit' || act === 'quit-no') { quitArmed = act === 'quit'; draw(); }
-    else if (act === 'quit-yes') quit();
+    else if (act === 'quit' || act === 'quit-no') { quitArmed = act === 'quit'; quitArmedAt = Date.now(); draw(); }
+    else if (act === 'quit-yes') { if (quitArmed && Date.now() - quitArmedAt >= QUIT_GUARD_MS) quit(); }
   }
 
   // Buttons can be stale by a few milliseconds, so every order is re-checked against the latest view.
@@ -381,8 +402,14 @@
   function announceEnd(v) {
     const drawGame = v.winner === -1, won = v.winner === v.you;
     const title = drawGame ? 'CAMPAIGN DRAW' : won ? 'CAMPAIGN VICTORY' : 'CAMPAIGN DEFEAT';
-    const sub = (drawGame ? 'Both capitals fell in the same turn' : won ? 'The enemy capital has fallen' : 'Your capital has fallen') +
-      ` (turn ${v.turn}).`;
+    // Winner -1 also comes from a server fault, so name a capital only when the map shows it fell.
+    const known = v.capital.length === 2;
+    const fell = side => known && v.owner[v.capital[side]] === 1 - side;   // side's capital is held by the other
+    let reason;
+    if (drawGame) reason = fell(0) && fell(1) ? 'Both capitals fell in the same turn' : 'The campaign ended in a draw';
+    else if (won) reason = fell(1 - v.you) ? 'The enemy capital has fallen' : 'The campaign was won';
+    else reason = fell(v.you) ? 'Your capital has fallen' : 'The campaign was lost';
+    const sub = `${reason} (turn ${v.turn}).`;
     if (typeof showEndOverlay === 'function') { showEndOverlay(title, sub, { leave: true }); return; }
     // no overlay helper (older client.js): drive the overlay elements directly
     const text = $('endText'), subEl = $('endSub'), btn = $('btnAgain'), box = $('end');
@@ -411,6 +438,7 @@
     view = null;
     sel = null;
     quitArmed = false;
+    quitArmedAt = 0;
     stopTimer();
     for (const key of ['map', 'panel']) {
       const el = $(key);

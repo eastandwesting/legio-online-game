@@ -298,3 +298,205 @@ test('a room that cannot be recovered is closed; its players are told and the se
   assert.equal((await a.next('room')).phase, 'lobby');
   await assertHealthy(s);
 });
+
+// ---- who counts as the same client (SPEC 7.2) ----
+
+// Opens sockets one by one with the given X-Forwarded-For values; resolves with how many stayed open.
+async function openWith(s, values, extra = {}) {
+  const sockets = [];
+  for (const value of values) sockets.push(await connect(s.wsUrl, { headers: { 'X-Forwarded-For': value, ...extra } }));
+  let accepted = 0;
+  for (const c of sockets) {
+    c.send({ t: 'ping' });
+    if (await c.next('pong', 500).then(() => true, () => false)) accepted++;
+  }
+  return { sockets, accepted };
+}
+
+test('behind one proxy only the entry the proxy added counts: forged leading hops buy nothing, nobody is locked out', async t => {
+  const s = await server(t, { trustProxy: true, maxPerIp: 20 });
+  // 25 sockets, each with another forged first entry in front of the same proxy-added entry
+  const forged = await openWith(s, Array.from({ length: 25 }, (_, i) => `10.9.${i}.1, 203.0.113.7`));
+  assert.equal(forged.accepted, 20, 'one real client: 20 sockets, whatever it writes in front');
+  assert.equal(s.game.stats().connections, 20);
+  // a victim whose address the attacker wrote in front is not locked out
+  const victim = await openWith(s, ['203.0.113.8']);
+  assert.equal(victim.accepted, 1, 'another client is accepted');
+  const named = await openWith(s, ['203.0.113.8, 203.0.113.7']);
+  assert.equal(named.accepted, 0, 'but the attacker\'s sockets are counted as the attacker, not as the name they wrote');
+  // the counter is released when sockets close
+  await forged.sockets[0].close();
+  for (let i = 0; i < 200 && s.game.stats().connections > 20; i++) await sleep(5);
+  assert.equal((await openWith(s, ['1.1.1.1, 203.0.113.7'])).accepted, 1);
+});
+
+test('with 2 trusted proxies the entry before the last counts; a header that is too short falls back to the socket address', async t => {
+  const s = await server(t, { trustProxy: 2, maxPerIp: 3 });
+  const a = await openWith(s, Array.from({ length: 5 }, (_, i) => `9.9.${i}.1, 203.0.113.7, 10.0.0.1`));
+  assert.equal(a.accepted, 3, 'the same client behind two proxies');
+  const b = await openWith(s, Array.from({ length: 5 }, (_, i) => `9.9.9.9, 203.0.113.${i + 20}, 10.0.0.1`));
+  assert.equal(b.accepted, 5, 'different clients behind the same last proxy');
+  const c = await openWith(s, ['203.0.113.50', '203.0.113.51', '203.0.113.52', '203.0.113.53']);   // one entry: not enough
+  assert.equal(c.accepted, 3, 'all counted as the socket address (127.0.0.1)');
+});
+
+test('behind a proxy the default limit per address is 40, direct it is 20', async t => {
+  const proxied = await server(t, { trustProxy: 1 });
+  assert.equal((await openWith(proxied, Array.from({ length: 42 }, () => '203.0.113.7'))).accepted, 40);
+  const direct = await server(t, { trustProxy: false });
+  assert.equal((await openWith(direct, Array.from({ length: 22 }, () => '203.0.113.7'))).accepted, 20);
+});
+
+async function withEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) { saved[k] = process.env[k]; if (vars[k] === undefined) delete process.env[k]; else process.env[k] = vars[k]; }
+  try { return await fn(); } finally {
+    for (const k of Object.keys(vars)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+}
+
+test('environment: TRUST_PROXY_HOPS, MAX_ROOMS, MAX_CONNECTIONS and MAX_PER_IP set the defaults; options and bad values', async t => {
+  const hostile = Array.from({ length: 8 }, (_, i) => `10.9.${i}.1, 203.0.113.7`);
+  // 1 hop (the Render default): all forged entries are one client
+  await withEnv({ RENDER: 'true', TRUST_PROXY_HOPS: undefined, MAX_PER_IP: '5' }, async () => {
+    assert.equal((await openWith(await server(t), hostile)).accepted, 5);
+  });
+  // no variable and no RENDER: the header is ignored, all sockets share the socket address
+  await withEnv({ RENDER: undefined, TRUST_PROXY_HOPS: undefined, MAX_PER_IP: '5' }, async () => {
+    assert.equal((await openWith(await server(t), hostile)).accepted, 5);
+    assert.equal((await openWith(await server(t), [...hostile, ...hostile].map((_, i) => `10.9.${i}.1`))).accepted, 5);
+  });
+  // TRUST_PROXY_HOPS=0 beats RENDER; =2 counts the second entry from the right
+  await withEnv({ RENDER: 'true', TRUST_PROXY_HOPS: '0', MAX_PER_IP: '3' }, async () => {
+    const s = await server(t);
+    assert.equal((await openWith(s, Array.from({ length: 5 }, (_, i) => `10.9.${i}.1, 203.0.113.${i}`))).accepted, 3);
+  });
+  await withEnv({ RENDER: undefined, TRUST_PROXY_HOPS: '2', MAX_PER_IP: '3' }, async () => {
+    const s = await server(t);
+    assert.equal((await openWith(s, Array.from({ length: 5 }, (_, i) => `10.9.${i}.1, 203.0.113.${i}, 10.0.0.1`))).accepted, 5);
+  });
+  // MAX_ROOMS and MAX_CONNECTIONS
+  await withEnv({ MAX_ROOMS: '2', MAX_CONNECTIONS: '3', RENDER: undefined, TRUST_PROXY_HOPS: undefined, MAX_PER_IP: undefined }, async () => {
+    const s = await server(t);
+    const [a, b, c] = [await connect(s.wsUrl), await connect(s.wsUrl), await connect(s.wsUrl)];
+    a.send({ t: 'create', name: 'A' }); await a.next('room');
+    b.send({ t: 'create', name: 'B' }); await b.next('room');
+    c.send({ t: 'create', name: 'C' });
+    assert.equal((await c.next('error')).code, 'server_full', 'MAX_ROOMS');
+    assert.equal((await (await connect(s.wsUrl)).closed).code, 1013, 'MAX_CONNECTIONS');
+  });
+  // options win over the environment; invalid values are ignored
+  await withEnv({ MAX_ROOMS: '2', MAX_PER_IP: '0', MAX_CONNECTIONS: 'lots', TRUST_PROXY_HOPS: 'many', RENDER: undefined }, async () => {
+    const s = await server(t, { maxRooms: 3 });
+    const cs = [];
+    for (let i = 0; i < 4; i++) { const c = await connect(s.wsUrl); c.send({ t: 'create', name: 'N' + i }); cs.push(await c.next(m => m.t === 'room' || m.t === 'error')); }
+    assert.deepEqual(cs.map(m => m.t), ['room', 'room', 'room', 'error'], 'the option 3, not MAX_ROOMS 2');
+    assert.equal((await openWith(await server(t), Array.from({ length: 22 }, () => '1.2.3.4'))).accepted, 20, 'bad values: the defaults');
+  });
+});
+
+test('the first proxied connection is logged once with the header and what it was counted as', async t => {
+  const s = await server(t, { trustProxy: 1 });
+  await openWith(s, ['203.0.113.7', '203.0.113.8']);
+  const notes = s.logs.filter(l => l.includes('proxy check'));
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /X-Forwarded-For "203\.0\.113\.7".*1 trusted hop\(s\), counted as client 203\.0\.113\.7/);
+  const bare = await server(t, { trustProxy: false });
+  await openWith(bare, ['203.0.113.7 <b>' + 'x'.repeat(400), '2.2.2.2']);
+  const warns = bare.logs.filter(l => l.includes('TRUST_PROXY_HOPS is 0'));
+  assert.equal(warns.length, 1);
+  assert.ok(warns[0].length < 500, 'a long header is cut');
+  const quiet = await server(t, { trustProxy: 1 });
+  const c = await connect(quiet.wsUrl);
+  c.send({ t: 'ping' }); await c.next('pong');
+  assert.deepEqual(quiet.logs, [], 'nothing without the header');
+});
+
+// ---- sockets that join no room (SPEC 7.2) ----
+
+test('sockets in no room are closed after unseatedIdleMs; pings do not count, seated sockets are left alone', async t => {
+  const s = await server(t, { unseatedIdleMs: 250, heartbeatMs: 60000, idleRoomMs: 60000, graceMs: 5000 });
+  const silent = await connect(s.wsUrl);
+  const pinger = await connect(s.wsUrl);
+  const chatty = await connect(s.wsUrl);
+  const seated = await connect(s.wsUrl);
+  const playing = await connect(s.wsUrl);
+  seated.send({ t: 'create', name: 'Seated' });
+  const lobby = await seated.next('room');
+  playing.send({ t: 'practice', name: 'Playing' });
+  await playing.next('room');
+  playing.send({ t: 'ready' });
+  await playing.next('start');
+  const timer = setInterval(() => {
+    pinger.ws.readyState === 1 && pinger.send({ t: 'ping' });
+    chatty.ws.readyState === 1 && chatty.send({ t: 'join', code: 'NOPE', name: 'x' });
+  }, 40);
+  t.after(() => clearInterval(timer));
+  const t0 = Date.now();
+  const [a, b] = await Promise.all([silent.closed, pinger.closed]);
+  assert.deepEqual([a.code, a.reason, b.code, b.reason], [1008, 'Idle', 1008, 'Idle']);
+  const took = Date.now() - t0;
+  assert.ok(took < 1500, `closed after ${took} ms`);
+  assert.equal(chatty.ws.readyState, 1, 'a socket that says something is not idle');
+  assert.equal(seated.ws.readyState, 1, 'a seated socket is the room\'s business');
+  assert.equal(playing.ws.readyState, 1, 'and so is one in a running game');
+  for (let i = 0; i < 200 && s.game.stats().connections > 3; i++) await sleep(5);
+  assert.equal(s.game.stats().connections, 3);
+  // leaving a room starts the clock again
+  seated.send({ t: 'leave' });
+  await seated.next('left');
+  assert.equal((await seated.closed).code, 1008);
+  assert.ok(lobby.code);
+  clearInterval(timer);
+  await Promise.all([chatty.close(), playing.close()]);
+});
+
+test('a flood of silent sockets does not hold the server: the slots come back and a new player gets in', async t => {
+  const s = await server(t, { maxConnections: 12, maxPerIp: 100, trustProxy: 1, unseatedIdleMs: 200, heartbeatMs: 60000 });
+  const hold = await openWith(s, Array.from({ length: 12 }, (_, i) => `203.0.113.${i + 1}`));
+  assert.equal(hold.accepted, 12);
+  assert.equal((await (await connect(s.wsUrl, { headers: { 'X-Forwarded-For': '198.51.100.1' } })).closed).code, 1013, 'full');
+  await Promise.all(hold.sockets.map(c => c.closed));
+  for (let i = 0; i < 400 && s.game.stats().connections > 0; i++) await sleep(5);
+  const fresh = await connect(s.wsUrl, { headers: { 'X-Forwarded-For': '198.51.100.1' } });
+  fresh.send({ t: 'ping', n: 3 });
+  assert.equal((await fresh.next('pong')).n, 3, 'no 1013 any more');
+});
+
+// ---- limits that the suite used to take on trust ----
+
+test('a client that stopped reading gets no more snapshots, and is dropped when its backlog grows', async t => {
+  const s = await server(t, { stepsPerTick: 1, graceMs: 5000 });
+  const { a, b } = await pair(s);
+  await readyBoth(a, b, 'start');
+  await a.next('snap');
+  const theirs = [...s.game._conns].find(ws => ws.seat && ws.seat.name === 'Bob');
+  assert.ok(theirs);
+  let backlog = 100 * 1024;                       // above SNAP_SKIP_BYTES (64 KiB), below MAX_BUFFERED (1 MiB)
+  Object.defineProperty(theirs, 'bufferedAmount', { get: () => backlog });
+  await b.flush().catch(() => {});
+  const seen = b.msgs.filter(m => m.t === 'snap').length;
+  const t0 = lastSnap(a).time;
+  await a.next(m => m.t === 'snap' && m.time >= t0 + 1);
+  assert.ok(b.msgs.filter(m => m.t === 'snap').length <= seen + 3, 'snapshots are skipped for a client this far behind');
+  assert.equal(b.ws.readyState, 1, 'but it is not dropped yet');
+  backlog = 2 * 1024 * 1024;                      // beyond MAX_BUFFERED: the next message to it ends the connection
+  b.send({ t: 'ping' });
+  assert.equal((await b.closed).code, 1006, 'terminated by the server');
+  assert.equal((await a.next('peer')).state, 'lost');
+});
+
+test('an order frame names at most 20 regiments: 20 are obeyed, 21 are ignored whole', async t => {
+  const s = await server(t, { stepsPerTick: 1 });
+  const { a, b, code } = await pair(s);
+  await readyBoth(a, b, 'start');
+  const battle = s.game._rooms.get(code).battle;
+  const mine = battle.regs.filter(r => r.owner === 0).map(r => r.id);
+  const pad = n => Array.from({ length: n }, (_, i) => 1000 + i);
+  a.send({ t: 'move', ids: [...mine, ...pad(12)], x: 800, y: 450 });          // 21 ids
+  await a.flush();
+  assert.ok(battle.regs.filter(r => r.owner === 0).every(r => r.order === null), '21 ids: nothing happens');
+  a.send({ t: 'move', ids: [...mine, ...pad(11)], x: 800, y: 450 });          // 20 ids
+  await a.flush();
+  assert.ok(battle.regs.filter(r => r.owner === 0).every(r => r.order && r.order.t === 'move'), '20 ids: obeyed');
+});

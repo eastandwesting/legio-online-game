@@ -375,3 +375,39 @@ test('a campaign battle that becomes due while a player is away starts paused an
   await Promise.all([a.next(camp('orders')), b2.next(camp('orders'))]);
   assert.deepEqual(s.logs, []);
 });
+
+test('an order that changes nothing costs no broadcast: no-op cmoves and refused orders send no camp view', async t => {
+  const s = await server(t);
+  const { a, b } = await pair(s, 'campaign');
+  await readyBoth(a, b, 'camp');
+  const views = c => c.msgs.filter(m => m.t === 'camp').length;
+  const settle = async () => { await a.flush(); await b.flush(); };
+  await settle();
+  const base = [views(a), views(b)];
+  const sends = [{ t: 'cmove', army: 1, to: null },        // nothing to cancel
+    { t: 'cmove', army: 1, to: 0 }, { t: 'cmove', army: 1, to: 4 },   // not a step to a neighbour
+    { t: 'cmove', army: 2, to: 10 },                       // somebody else's army
+    { t: 'recruit', prov: 12, type: 'sword' },             // not our province
+    { t: 'recruit', prov: 0, type: 'dragon' }];
+  for (const m of sends) a.send(m);
+  await settle();
+  assert.deepEqual([views(a), views(b)], base, 'nothing changed, nothing sent');
+
+  a.send({ t: 'cmove', army: 1, to: 2 });                  // a real change: both seats get the view
+  await a.next(m => m.t === 'camp' && m.moves[1] === 2);
+  await b.next('camp');
+  const after = [views(a), views(b)];
+  assert.deepEqual(after, [base[0] + 1, base[1] + 1]);
+  for (let i = 0; i < 10; i++) a.send({ t: 'cmove', army: 1, to: 2 });   // the same destination again and again
+  await settle();
+  assert.deepEqual([views(a), views(b)], after, 'repeating an order is free');
+  a.send({ t: 'cmove', army: 1, to: null });               // a real cancel
+  await a.next(m => m.t === 'camp' && !('1' in m.moves));
+  for (let i = 0; i < 10; i++) a.send({ t: 'cmove', army: 1, to: null });
+  await settle();
+  assert.equal(views(a), after[0] + 1);
+  assert.equal(views(b), after[1] + 1);
+  a.send({ t: 'recruit', prov: 0, type: 'sword' });         // recruiting always changes something
+  assert.equal((await a.next('camp')).units, 5);
+  assert.deepEqual(s.logs, []);
+});

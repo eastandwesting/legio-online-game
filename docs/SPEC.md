@@ -68,10 +68,10 @@ characters `A-Z0-9`, case-insensitive on input.
 |---|---|
 | `{t:'room', code, phase, mode, you, token, players:[{name, ready, bot, connected, grace?}]}` | Room state. `you` = your seat index (0 or 1), `token` = YOUR secret seat token (never another seat's). `connected:false` + `grace` (whole seconds left) while a seat is waiting for a rejoin. Sent whenever seats, ready flags, connectivity or the lobby/over phase change, and first after any successful create / join / rejoin. |
 | `{t:'left', reason?}` | You are no longer in a room. `reason`: `'leave'`, `'idle'`, `'closed'`. |
-| `{t:'error', msg, code?}` | `code`: `'bad_room'`, `'server_full'`, `'rejoin_failed'`, `'rate'`, `'shutdown'`. `msg` is plain text for the player. |
-| `{t:'start', you, W, H, types, limit}` | A battle begins, or you rejoined one. `limit` = time limit in seconds. |
+| `{t:'error', msg, code?}` | `code`: `'bad_room'`, `'server_full'`, `'rejoin_failed'`, `'rate'`, `'shutdown'`. `msg` is plain text for the player. `'rate'` also answers a `join` from an address that has failed too many joins (7.2). |
+| `{t:'start', you, W, H, types, limit, startMen}` | A battle begins, or you rejoined one. `limit` = time limit in seconds. `startMen` = object mapping each regiment id (as a string, `"1"`...) to its integer men at the start of this battle, for both sides (the denominator of the unit cards). It is the same object again when the `start` is a resync after a rejoin, whatever the regiments have lost since. |
 | `{t:'snap', time, left, regs}` | 20 per second while the battle runs. `left` = whole seconds until the time limit. `regs` = array of `[id, owner, type, x, y, face, men, morale, state, ammo, engagedId]` (layout unchanged from v1). |
-| `{t:'end', winner, reason, forfeit?}` | Battle finished, or the whole game ended by forfeit. `winner`: `0`, `1` or `-1` (draw). `reason`: `'rout'`, `'timeout'`, `'forfeit'`. `forfeit:true` exactly when `reason==='forfeit'`. |
+| `{t:'end', winner, reason, forfeit?}` | Battle finished, or the whole game ended by forfeit. `winner`: `0`, `1` or `-1` (draw). `reason`: `'rout'`, `'timeout'`, `'forfeit'`. `forfeit:true` exactly when `reason==='forfeit'`. A human who may have missed it is sent it again, once, right after the `room` of its next `rejoin` (7.3); a client therefore has to accept an `end` after a `room`, also when it is already showing that result. `winner` is numbered as the seat is numbered in the `room` that precedes it. |
 | `{t:'peer', state, grace?}` | `state:'lost'`: the other seat dropped, game paused, `grace` seconds until they forfeit. `state:'back'`: they returned. |
 | `{t:'camp', ...}` | Campaign view, see 7.6. |
 | `{t:'pong', n}` | Reply to `ping`. |
@@ -82,8 +82,9 @@ characters `A-Z0-9`, case-insensitive on input.
 room phase is `campaign` during orders/resolution, `battle` during a campaign battle and `between` for the
 short gap after a campaign battle. Campaign sub-phase (`camp.phase`): `orders`, `resolving`, `battle`, `over`.
 
-State sync sent to a socket after create / join / rejoin, in this order: `room`; then `camp` if a campaign
-is in progress; then `start` if a battle is running (snapshots follow).
+State sync sent to a socket after create / join / rejoin, in this order: `room`; then, on a rejoin only and
+only when a result is owed (7.3), `end`; then `camp` if a campaign is in progress; then `start` if a battle is
+running (snapshots follow).
 
 ## 3. sim.js (SIM track)
 
@@ -129,8 +130,12 @@ Required changes:
 - **P0 Ranged units out of ammo fight in melee at melee range.** Add `meleeRange: 16` to archers. Defect
   fixed: archers with no ammo dealt melee damage from 182 units away because the shooting range was reused.
 - **P0 Time limit.** When `time >= timeLimit` and the battle is not over: `over = true`,
-  `reason = 'timeout'`, `winner = defender` if `defender` is 0 or 1; otherwise compare surviving fractions
-  (live men / total `startMen` per side): difference under 0.02 -> `-1` (draw), else the higher side.
+  `reason = 'timeout'`, and the winner follows from the surviving fraction of each side:
+  fraction = (men of regiments that are still fighting + half the men of regiments that are routing but
+  not yet gone) / total `startMen` of that side. With a `defender` (0 or 1, a campaign battle) the defender
+  wins unless its fraction is below 0.75 times the attacker's, in which case the attacker wins (so a
+  regiment that merely runs away cannot hold the field against an army that is still whole). Without a
+  defender a difference under 0.02 is a draw (`-1`), otherwise the side with the larger fraction wins.
   Normal endings set `reason = 'rout'`. `snapshot().left = max(0, ceil(timeLimit - time))`.
 - **P0 Facing on arrival.** A move order with a finite `face` leaves the regiment facing that way when it
   arrives. A regiment with no order that is attacked and is not itself attacking turns to face its nearest
@@ -152,7 +157,8 @@ export function botThink(battle, side)   // call once per sim tick for an AI-con
 Issues orders only through `giveOrder`. Deterministic, never throws, keeps its own state in a `WeakMap`
 keyed by the battle. Acts every 0.5 s of sim time. Behaviour (keep it simple and robust):
 
-- Infantry (sword, spear): attack the nearest live enemy; spears prefer enemy cavalry within 220.
+- Infantry (sword, spear): attack the nearest live enemy; spears prefer enemy cavalry within 220, but not
+  while any enemy is within 45 of them (a spear in contact keeps fighting whoever is on top of it).
 - Archers with ammo: if the nearest enemy is closer than 70, step directly away by about 110 (stay inside
   the field; if cornered, shoot instead); otherwise attack the weakest enemy in range, else the nearest.
   Archers without ammo behave like infantry.
@@ -173,6 +179,11 @@ Keep it pure. Keep exports `PROVS`, `CAPITAL`, `EDGES`, `ADJ`, `COST`, `START_GO
   `Object.hasOwn`, ownership) and returns `false` without mutating on bad input; none may throw. Defect
   fixed: `recruit(c, p, prov, 'constructor')` passed the `type in COST` check, set gold to `NaN` and created
   a garbage unit.
+- **Return values of the order mutators.** `recruit(...)` is `true` when a unit was recruited. `setMove(c, p,
+  armyId, to)` is `true` only when the pending marches actually changed: a new march, another destination,
+  or the cancellation of a march that existed. It is `false` for refused input AND for an order that changes
+  nothing: `to === null` with nothing pending, or the same destination again. The server sends the campaign
+  view only after a call that returned `true`, so a no-op order costs no broadcast.
 - **P0 `resolveMoves(c)`** returns battles as `{prov, a0, a1, defender}` where `defender` is the province
   owner before this turn's captures if that is 0 or 1, else `null`.
 - **P0 `applyBattle(c, battle, winner, survivors)`**: the loser's army is removed; a draw (`-1`) removes
@@ -185,19 +196,30 @@ Keep it pure. Keep exports `PROVS`, `CAPITAL`, `EDGES`, `ADJ`, `COST`, `START_GO
 - **P0 `endTurn(c)`**: income as today, then replenishment: every unit of an army standing in a province
   owned by its own player regains `ceil(REPLENISH * max)` men, capped at max; then `turn++`, ready reset,
   log trimmed.
-- **P1 AI (`aiTurn`)**: recruit at the capital as today. An army at its own capital stays put while any
-  enemy army is within 2 steps of that capital, unless the enemy is adjacent and the garrison has at least
-  1.5x its men (then it attacks). A field army of 5+ units returns toward its capital when the capital is
-  threatened and it is closer than the enemy's nearest target. Otherwise as today (8+ units: march on the
+- **P1 AI (`aiTurn`)**: recruit at the capital as today. The army at its own capital ("the garrison") holds
+  while an enemy army is within 2 steps of that capital, but at most 2 turns in a row; on the third it
+  attacks the nearest enemy army (the first step toward it) whatever the odds. It also attacks at once, with
+  no waiting, when it has at least 70% of the men of all enemy armies within 2 steps of the capital. After
+  such an attack the AI is "on the press" for 3 turns: its armies that stand next to an enemy army attack it
+  instead of walking back (strength is not checked), so a sortie cannot turn into a shuffle that never meets
+  the enemy. A field army of 5+ units returns toward its capital when the capital is threatened and it is
+  closer than the enemy's nearest target (unless on the press). Otherwise as today (8+ units: march on the
   enemy capital; smaller: take the nearest province that is not its own and has no enemy army), but never
   step into a province holding an enemy army with more men than itself unless the AI army has 12+ units.
-  Deterministic. Never throws. Never leaves the game unable to progress.
+  An army that was turned back by a crossing last turn waits or attacks again by a deterministic hash of the
+  turn, the army id and the AI's own gold (not by turn parity, which an opponent could learn and time a
+  counter-march against). Deterministic. Never throws. Never leaves the game unable to progress: a passive
+  enemy parked two steps from the AI capital is engaged within a few turns, and a lone garrison cannot keep
+  a host off its capital for ever. The AI keeps its counters in the campaign object (`c.hold`, `c.press`),
+  keyed by turn, so asking for the same turn's orders twice changes nothing.
 
 Tests (`test/campaign.test.mjs`): validation incl. prototype keys; bounce; merge; battle list + defender;
 regroup conserves men; draw removes both; capture and capital win; double capital capture = draw; income;
-replenish only at home and capped; no premature elimination; 200-turn AI-vs-AI soak with battles
-auto-resolved by a simple strength comparison in the test (no throw, gold never negative or NaN, unit cap
-respected).
+replenish only at home and capped; no premature elimination; `setMove` return values; 200-turn AI-vs-AI soak
+with battles auto-resolved by a simple strength comparison in the test (no throw, gold never negative or NaN,
+unit cap respected); the garrison holds at most 2 turns; a passive enemy two steps from the AI capital is
+engaged or something is captured within 8 turns; a lone garrison counter-marching on any fixed pattern cannot
+stop an assault for ever.
 
 ## 6. lib/http.js and lib/limits.js (NET track)
 
@@ -206,9 +228,26 @@ respected).
 export function createHttpHandler({ publicDir, getStats }) -> (req, res) => void
 // lib/limits.js
 export function createTokenBucket(capacity, refillPerSec, now = Date.now) -> { take(n = 1): boolean }
-export function clientIp(req, trustProxy) -> string      // first X-Forwarded-For hop when trustProxy, else socket address
+export function clientIp(req, trustProxy) -> string      // see below
+export function proxyHops(trustProxy) -> number          // false/undefined/0 -> 0, true -> 1, positive integer N -> N, else 0
 export function createIpCounter(maxPerIp) -> { add(ip): boolean, remove(ip): void, count(ip): number }
+export function createFailureThrottle(max, windowMs, now = Date.now) -> { blocked(key), fail(key), prune(), size() }
 ```
+
+`clientIp(req, trustProxy)`: `trustProxy` is `false` (the socket address), `true` (= 1 trusted proxy) or a
+positive integer N = the number of proxies of our own in front of the server. With N hops the address is the
+N-th entry of `X-Forwarded-For` counted from the RIGHT: every proxy appends the address it received the
+connection from, so the entries on the left may be anything the client wrote, and the entry N places from
+the right is the first one that was not written by the client. With fewer than N entries, or when that
+entry is not an IP address, the socket address is used. No other header (`CF-Connecting-IP`, `X-Real-IP`,
+`Forwarded`) is believed. The result is a key, never empty (`'unknown'` at worst), lower-case, without port or
+brackets: an IPv4-mapped IPv6 address is the IPv4 address, any other IPv6 address is its /64 prefix as four
+hex groups without leading zeros (`2001:db8:1:1`), so one subscriber cannot multiply connections by rotating
+inside its /64, and the different spellings of one address are one key.
+
+`createFailureThrottle`: `blocked(key)` is true once `max` failures were recorded less than `windowMs` ago,
+until the oldest of them ages out. At most `max` timestamps are kept per key and at most 10000 keys; `prune()`
+drops expired keys. A bad configuration blocks (denies) rather than throwing.
 
 HTTP handler, all P0:
 
@@ -258,18 +297,28 @@ Options (all optional; tests shrink the timers):
 | `battleTimeLimit` | `BATTLE_TIME_LIMIT` | Seconds of sim time per battle. |
 | `betweenMs` | 3500 | Gap after a campaign battle before the campaign continues. |
 | `resolveDelayMs` | 1200 | Pause after both turns are in, before the first battle. |
-| `graceMs` | 60000 | How long a dropped seat is held. |
+| `graceMs` | 60000 | How long a dropped seat is held (in a running game against another human: the per-seat allowance, 7.3). |
+| `graceRefill` | 0.25 | Allowance earned back per millisecond a seat is connected (7.3). |
 | `resumeDelayMs` | 1500 | Delay before a paused battle resumes after a rejoin. |
 | `hurryMs` | 90000 | Hurry-up timer for the slower campaign player. |
 | `heartbeatMs` | 25000 | WebSocket ping interval. |
 | `idleRoomMs` | 45 * 60000 | Rooms with no client activity for this long are closed. |
-| `maxRooms` | 200 | |
+| `unseatedIdleMs` | 5 * 60000 | A socket in no room that sent nothing but `ping` for this long is closed (1008, `Idle`). |
+| `maxRooms` | 60 | Rooms in memory (lobbies and games). Chosen from a CPU measurement, see the README. |
 | `maxConnections` | 500 | |
-| `maxPerIp` | 20 | |
+| `maxPerIp` | 20 (40 behind a proxy) | Connections per client address; a proxy's address may stand for many players. |
+| `joinFails` / `joinWindowMs` | 8 / 60000 | Failed joins per address per window before joins are answered `rate` (7.2). |
 | `rate` | `{capacity: 60, refillPerSec: 30}` | Per-connection message budget. |
-| `trustProxy` | `!!process.env.RENDER` | Use `X-Forwarded-For` for client IPs. |
+| `trustProxy` | `TRUST_PROXY_HOPS`, else 1 on Render (`RENDER` set), else 0 | Number of proxies of our own in front of the server (`false` = 0, `true` = 1, an integer N), see 6. |
 | `log` | `console.log` | Logger function; tests pass a no-op. |
 | `publicDir` | `./public` next to server.js | |
+
+Environment variables (read by `createGameServer` for the options that were not passed, so they also apply
+when run directly; an option passed in code always wins; a value that is not a valid integer is ignored):
+`TRUST_PROXY_HOPS` (integer >= 0; default 1 when `RENDER` is set, else 0 = off), `MAX_ROOMS`,
+`MAX_CONNECTIONS`, `MAX_PER_IP` (positive integers). The first connection that carries an `X-Forwarded-For`
+header logs one line with the (bounded, printable-only) header and the client it was counted as, or a
+warning when `TRUST_PROXY_HOPS` is 0, so a wrong hop count shows up on the first visit.
 
 ### 7.2 Robustness (P0)
 
@@ -284,9 +333,22 @@ Options (all optional; tests shrink the timers):
   1.2 s resolve delay or the 3.5 s gap after a campaign battle left timers running against a room whose
   campaign was already cleared (`C.settle(null)` -> uncaught TypeError -> process exit), or started a ghost
   battle in a room that was back in the lobby.
-- Limits: `maxPayload` 4096; connection refused (close code 1013) beyond `maxConnections` or `maxPerIp`;
-  `create` / `practice` beyond `maxRooms` -> `error` `server_full`; per-connection token bucket: a message
-  over budget is dropped, and a connection that has more than 200 messages dropped is closed with code 1008.
+- Limits: `maxPayload` 4096; connection refused (close code 1013) beyond `maxConnections` or `maxPerIp`
+  (per client address as `clientIp` computes it, 6); `create` / `practice` beyond `maxRooms` -> `error`
+  `server_full`; per-connection token bucket: a message over budget is dropped, and a connection that has
+  more than 200 messages dropped is closed with code 1008.
+- **Capacity is never made by destroying somebody's room.** A room is only destroyed by its own timers (grace
+  expiry, idle expiry), an explicit leave, or a fault. The room records the address that created it
+  (`room.ip`). An address may own at most 4 abandoned rooms (rooms in which no human is connected); when it
+  creates or starts a practice room while already owning 4, THAT address's oldest abandoned room is
+  destroyed first. Another address's room, and any room with a connected human, is never touched, so a
+  reload or a network blip is always covered by the grace period; at `maxRooms` the answer is `server_full`.
+- **Unseated sockets.** A socket that is in no room (never joined one, or left / was removed from one) and
+  sends no message other than `ping` for `unseatedIdleMs` (5 minutes) is closed with code 1008, reason
+  `Idle`. Seated sockets are never closed by this; their rooms have idle expiry and the heartbeat.
+- **Room-code guessing.** Room codes stay 4 characters. After 8 failed joins (answers `bad_room`) from one
+  address within 60 s, further `join` messages from that address are answered with `error` code `rate`,
+  without any room lookup, until fewer than 8 failures remain inside the window.
 - Heartbeat: every `heartbeatMs` ping each socket; a socket that did not answer the previous ping is
   terminated (which then follows the normal seat-lost path).
 - Idle expiry: a room with no client message other than `ping` for `idleRoomMs` is closed: its players get
@@ -302,9 +364,10 @@ Options (all optional; tests shrink the timers):
 ### 7.3 Seats, tokens, grace, rejoin (P1, but the uniform seat model below is the design; if you must cut
 scope, keep tokens + grace + rejoin for running games)
 
-- A seat = `{name, token, ws | null, ready, bot, lostAt, ...}`. `token` = 16+ random bytes
+- A seat = `{name, token, ws | null, ready, bot, lostAt, grace, owedEnd, ...}`. `token` = 16+ random bytes
   (`crypto.randomBytes`), base64url, sent only to its owner inside `room`.
-- Socket closes (any phase): the seat stays, `ws = null`, a grace timer of `graceMs` starts, the other
+- Socket closes (any phase): the seat stays, `ws = null`, a grace timer starts (`graceMs`, or what is left of
+  the seat's allowance in a running game against another human, see below), the other
   human gets `peer` `lost` and a fresh `room`. While any human seat of a room is lost the room is PAUSED:
   no sim steps, no snapshots, no hurry-timer expiry. Timers that fire while paused must not skip work:
   a campaign battle that becomes due simply starts paused.
@@ -318,6 +381,23 @@ scope, keep tokens + grace + rejoin for running games)
   forfeit:true}`, the game is discarded (`gen++`), bot seats are dropped, the room returns to `lobby` with
   the remaining human in seat 0 (send them a fresh `room`), exactly as v1 did. A room with no human seat
   left is destroyed. In `lobby` / `over` the seat is just removed and the room re-broadcast.
+- **Grace is an allowance in a running game against another human.** In phases `battle`, `campaign` and
+  `between` of a room with two human seats, `graceMs` is not a fresh timer per drop but a per-seat allowance:
+  a drop is held for what is left of it (`peer` `lost` carries that, in whole seconds), time away plus the
+  resume delay it causes is spent when the seat returns, and the allowance refills at `graceRefill` (0.25) per
+  millisecond connected (60 s back per 4 minutes), never beyond `graceMs`. So dropping again and again cannot
+  freeze the other player's game for ever, while a single reload or blip always gets the full allowance.
+  Everywhere else nobody is kept waiting and every drop gets the full `graceMs` at no cost: in the lobby and
+  on the result screen, and in a practice room (the other seat is the AI), however often the link drops.
+- **A result the seat may have missed is owed.** When a quick battle ends (or an aborted one is ended as a
+  draw) every human seat is owed the `end` message; when the other player forfeits while a seat is away, that
+  seat is owed `{t:'end', winner:<its seat as numbered after the reset: 0>, reason:'forfeit', forfeit:true}`.
+  A socket can die without the server noticing for a while, so "away" includes a seat that is still counted
+  as connected when the result goes out. The owed message is sent once, immediately after the `room` of the
+  next `rejoin` (state sync, 2.3), and the debt is cleared when it is sent, when the seat sends `ready` for the
+  rematch, and when the next game starts or the room resets to the lobby. A reload on the result screen
+  therefore shows the result again, once. Campaign results are not owed this way: they are in the `camp` view
+  (`winner`, `phase:'over'`, the log).
 - `leave` replies `{t:'left', reason:'leave'}` and clears the socket's room so it can create or join again.
 - A socket that is already seated ignores `create` / `practice` / `join` / `rejoin`.
 
@@ -437,13 +517,14 @@ Add a "Leave room" button in the room view and a small "Quit" button during batt
   swords / spears / archers / cavalry, `H` or `?` help. Ignore keys while typing in an input.
 - **P0** HUD: men and unit counts for both sides, battle clock from `snap.left` (mm:ss, red under 30 s),
   your colour and side.
-- **P1** Unit cards along the bottom: one card per own regiment (type glyph and name, men / start men,
-  morale bar, greyed when routing or dead); click selects, shift-click adds, double-click selects all of
+- **P1** Unit cards along the bottom: one card per own regiment (type glyph and name, men / start men
+  with the start men taken from `start.startMen`, morale bar, greyed when routing or dead); click selects, shift-click adds, double-click selects all of
   that type; selected cards are highlighted.
 - **P1** Help overlay listing the controls and the unit match-ups (spears stop cavalry; cavalry runs down
   archers and wins on flanks and rear; archers wear infantry down; rear attacks break morale), and stating
-  that a battle ends at the time limit (the defender holds in a campaign; otherwise the side with more of
-  its army left wins).
+  that a battle ends at the time limit (in a campaign the defender holds unless it has lost clearly more than
+  the attacker, below 0.75 of the attacker's surviving share; otherwise the side with more of its army left
+  wins, and near-equal is a draw).
 - Show routing units distinctly (white flag or faded) and a small facing tick on selected regiments.
 - A data-URI favicon in `index.html` (avoids a 404).
 
@@ -464,7 +545,8 @@ Uses only the 8.1 contract. Styles it needs beyond the existing ones go in a `<s
   "Waiting for opponent: N s") with a live countdown; never let it go below 0.
 - **P0** A "Quit campaign" button (confirm) calling `leaveRoom()`.
 - **P1** A short rules box: units regain 25% strength per turn in friendly provinces; survivors regroup
-  after a battle; the province owner defends, and the defender holds if a battle runs out of time; armies
+  after a battle; the province owner defends, and the defender holds if a battle runs out of time unless it has lost clearly
+  more than the attacker; armies
   that cross paths turn back; take the enemy capital to win.
 - Escape every string that comes from the server with `escapeHtml` before using `innerHTML`.
 

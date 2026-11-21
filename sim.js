@@ -38,7 +38,8 @@ const REAR = 2.3, FLANK = 1.2;   // radians off the target's facing
 const CHARGE_TIME = 1;       // seconds of charge bonus at the start of a melee
 const ROUT_TIME = 20;        // seconds a routing regiment runs before it is gone
 const ROUT_MEN = 0.15;       // a regiment breaks below this share of its starting strength
-const DRAW_MARGIN = 0.02;
+const DRAW_MARGIN = 0.02;        // timeout without a defender: a gap in surviving share under this is a draw
+const DEFENDER_EDGE = 0.75;      // timeout with a defender: it holds unless its share is below this times the attacker's
 const EPS = 1e-9;
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -306,15 +307,29 @@ function settle(view) {
   }
 }
 
-// Share of a side's starting strength that is still in the fight.
+// Share of a side's starting strength that is still in the fight. A regiment that is routing but not
+// yet gone counts for half its men (the same half it would take back to a campaign).
 function strength(regs, side) {
   let now = 0, start = 0;
   for (const r of regs) {
     if (r.owner !== side) continue;
     start += r.startMen;
-    if (live(r)) now += r.men;
+    if (r.state === 'rout') now += r.men / 2;
+    else if (r.state !== 'dead') now += r.men;
   }
   return start > 0 ? now / start : 0;
+}
+
+// Timeout verdict. With a defender (campaign): the defender holds unless its surviving share is below
+// DEFENDER_EDGE times the attacker's, so a regiment that merely runs away cannot win on the clock.
+// Without one: the larger surviving share wins and a gap under DRAW_MARGIN is a draw.
+function verdict(b) {
+  const f = [strength(b.regs, 0), strength(b.regs, 1)];
+  if (b.defender === 0 || b.defender === 1) {
+    const d = b.defender;
+    return f[d] < DEFENDER_EDGE * f[1 - d] ? 1 - d : d;
+  }
+  return Math.abs(f[0] - f[1]) < DRAW_MARGIN ? -1 : f[0] > f[1] ? 0 : 1;
 }
 
 function judge(b) {
@@ -326,9 +341,7 @@ function judge(b) {
   }
   if (b.time < b.timeLimit - EPS) return;
   b.over = true; b.reason = 'timeout';
-  if (b.defender === 0 || b.defender === 1) { b.winner = b.defender; return; }
-  const f0 = strength(b.regs, 0), f1 = strength(b.regs, 1);
-  b.winner = Math.abs(f0 - f1) < DRAW_MARGIN ? -1 : f0 > f1 ? 0 : 1;
+  b.winner = verdict(b);
 }
 
 export function step(b) {

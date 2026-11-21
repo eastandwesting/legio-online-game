@@ -4,7 +4,8 @@ import { W, H, TICK, TYPES, giveOrder } from './sim.js';
 
 const THINK_TICKS = 10;        // act every 0.5 s of sim time
 const RETARGET_TICKS = 60;     // cavalry reconsiders its target every 3 s
-const SPEAR_GUARD = 220;       // spears go for enemy cavalry this close
+const SPEAR_GUARD = 220;       // spears go for enemy cavalry this close ...
+const IN_CONTACT = 45;         // ... unless an enemy is already this close to them: that fight comes first
 const DANGER = 70;             // archers give ground to melee troops this close ...
 const RETREAT = 110;           // ... by about this much
 const CORNERED = 45;           // a shorter retreat is not worth turning around for
@@ -48,7 +49,7 @@ function infantry(battle, side, r, foes) {
   if (current && r.state === 'fighting') return;            // never turn its back on a melee
   let pick = nearest(r, foes);
   if (current && pick && gap(r, current) <= gap(r, pick) + STICKY) pick = current;
-  if (r.type === 'spear') {
+  if (r.type === 'spear' && !nearest(r, foes, IN_CONTACT)) {
     pick = nearest(r, foes.filter(f => f.type === 'cav'), SPEAR_GUARD) || pick;
   }
   attack(battle, side, r, pick);
