@@ -117,7 +117,7 @@ function playTurn(c, { rnd = null, noise = 0, label = '' } = {}) {
 test('exports and map constants', () => {
   for (const name of ['PROVS', 'CAPITAL', 'EDGES', 'ADJ', 'COST', 'START_GOLD', 'INCOME', 'MAX_UNITS', 'REPLENISH',
     'newCampaign', 'totalUnits', 'recruit', 'setMove', 'resolveMoves', 'applyBattle', 'settle', 'endTurn', 'aiTurn',
-    'regroup']) assert.ok(name in C, `missing export ${name}`);
+    'regroup', 'TURN_LIMIT', 'MIRROR']) assert.ok(name in C, `missing export ${name}`);
   assert.equal(C.REPLENISH, 0.25);
   assert.deepEqual(C.CAPITAL, [0, 12]);
   assert.equal(C.ADJ.length, C.PROVS.length);
@@ -909,6 +909,275 @@ test('AI vs AI: 200-turn soak with auto-resolved battles (no throw, sane gold, u
   }
   assert.ok(battles > 40, `only ${battles} battles in 40 campaigns`);
   assert.ok(finished >= 30, `only ${finished} of 40 campaigns reached a result`);
+});
+
+// ---------- turn limit and end reasons (SPEC 5) ----------
+
+test('TURN_LIMIT is 100, newCampaign has no end reason, settle names the reason for a capture', () => {
+  assert.equal(C.TURN_LIMIT, 100);
+  assert.equal(C.newCampaign().endReason, null);
+  const win = setup([[0, 12, units('sword', 1)]]);
+  win.owner[12] = 1;
+  C.settle(win);
+  assert.deepEqual([win.winner, win.endReason], [0, 'capital']);
+  const both = setup([[0, 12, units('sword', 1)], [1, 0, units('sword', 1)]]);
+  C.settle(both);
+  assert.deepEqual([both.winner, both.endReason], [-1, 'both_capitals']);
+  const quiet = setup([[0, 0, units('sword', 1)]]);
+  C.settle(quiet);
+  assert.deepEqual([quiet.winner, quiet.endReason], [null, null]);
+});
+
+test('endTurn at the turn limit: more provinces win, equal is a draw, nothing else changes; the turn before it just advances', () => {
+  const at = turn => { const c = setup([], { gold: [10, 20] }); c.turn = turn; return c; };
+  // one turn before the limit: an ordinary turn
+  const early = at(C.TURN_LIMIT - 1);
+  assert.equal(C.endTurn(early), true);
+  assert.deepEqual([early.turn, early.winner, early.endReason], [C.TURN_LIMIT, null, null]);
+  assert.deepEqual(early.gold, [10 + 4 * C.INCOME, 20 + 4 * C.INCOME]);
+  // equal provinces (4 each): a draw
+  const even = at(C.TURN_LIMIT);
+  assert.equal(C.endTurn(even), true);
+  assert.deepEqual([even.winner, even.endReason, even.turn], [-1, 'turn_limit', C.TURN_LIMIT]);
+  assert.match(even.log.at(-1), /Turn limit reached: the campaign is a draw/);
+  assert.deepEqual(even.gold, [10, 20], 'no income for a turn that never comes');
+  // more provinces win, for either side
+  for (const side of [0, 1]) {
+    const c = at(C.TURN_LIMIT);
+    c.owner[6] = side;
+    assert.equal(C.endTurn(c), true);
+    assert.deepEqual([c.winner, c.endReason], [side, 'turn_limit'], `side ${side}`);
+    assert.match(c.log.at(-1), new RegExp(`${['Red', 'Blue'][side]} wins with more provinces \\(5 to 4\\)`));
+  }
+  const lost = at(C.TURN_LIMIT);                       // a lost province counts like any other
+  lost.owner[0] = -1; lost.owner[1] = 1;
+  C.endTurn(lost);
+  assert.deepEqual([lost.winner, lost.endReason], [1, 'turn_limit']);
+  // after the end everything is refused, as for any finished campaign
+  assert.equal(C.endTurn(even), false);
+  refused(even, () => C.recruit(even, 0, 0, 'sword'), 'recruit after the end');
+  const late = at(C.TURN_LIMIT + 5);                   // a campaign that somehow got past it still ends
+  assert.equal(C.endTurn(late), true);
+  assert.equal(late.winner, -1);
+});
+
+test('AI vs AI: the perfectly mirrored default game cannot run for ever (regression: 300 turns of drawn battles at Heartland)', () => {
+  const c = C.newCampaign();
+  let turns = 0;
+  while (c.winner === null && turns++ < 400) {
+    C.aiTurn(c, 0); C.aiTurn(c, 1);
+    playTurn(c, { label: 'mirror' });
+  }
+  assert.notEqual(c.winner, null, 'it ended');
+  assert.ok(c.turn <= C.TURN_LIMIT, `turn ${c.turn}`);
+  assert.ok(['turn_limit', 'both_capitals', 'capital'].includes(c.endReason), c.endReason);
+  if (c.endReason === 'turn_limit') assert.equal(c.winner, -1, 'a mirrored game holds equally many provinces');
+});
+
+// ---------- the AI does not favour a seat (SPEC 5) ----------
+
+const MIRROR = [12, 9, 10, 11, 7, 8, 6, 4, 5, 1, 2, 3, 0];
+
+test('MIRROR is the map\'s mirror symmetry: an involution, an automorphism of EDGES, a mirror of the coordinates', () => {
+  assert.deepEqual(C.MIRROR, MIRROR);
+  const edge = (a, b) => (a < b ? `${a}-${b}` : `${b}-${a}`);
+  const edges = new Set(C.EDGES.map(([a, b]) => edge(a, b)));
+  for (let i = 0; i < C.PROVS.length; i++) {
+    assert.equal(MIRROR[MIRROR[i]], i, `involution at ${i}`);
+    assert.equal(C.PROVS[i].x + C.PROVS[MIRROR[i]].x, 1000, `x mirrored at ${i}`);
+    assert.equal(C.PROVS[i].y, C.PROVS[MIRROR[i]].y, `y kept at ${i}`);
+  }
+  for (const [a, b] of C.EDGES) assert.ok(edges.has(edge(MIRROR[a], MIRROR[b])), `edge ${a}-${b} has no mirror image`);
+  assert.deepEqual(C.CAPITAL.map(p => MIRROR[p]), [C.CAPITAL[1], C.CAPITAL[0]]);
+});
+
+// A random position without pending marches or bounces (the bounce rule hashes the seat on purpose).
+function randomPosition(rnd) {
+  const c = C.newCampaign();
+  c.owner = c.owner.map(() => Math.floor(rnd() * 3) - 1);
+  c.owner[0] = rnd() < 0.9 ? 0 : 1; c.owner[12] = rnd() < 0.9 ? 1 : 0;
+  c.armies = [];
+  const used = new Set();
+  let id = 1;
+  for (let i = Math.floor(rnd() * 5); i > 0; i--) {
+    const owner = Math.floor(rnd() * 2), prov = Math.floor(rnd() * C.PROVS.length);
+    if (used.has(`${owner}:${prov}`)) continue;
+    used.add(`${owner}:${prov}`);
+    const us = Array.from({ length: 1 + Math.floor(rnd() * 9) }, () => {
+      const type = pick(rnd, Object.keys(C.COST));
+      return unit(type, 1 + Math.floor(rnd() * TYPES[type].men));
+    });
+    c.armies.push({ id: id++, owner, prov, units: us });
+  }
+  c.nextId = id; c.turn = 1 + Math.floor(rnd() * 40);
+  c.gold = [Math.floor(rnd() * 600), Math.floor(rnd() * 600)];
+  if (rnd() < 0.5) {
+    c.hold = [null, null]; c.press = [null, null];
+    for (const p of [0, 1]) {
+      if (rnd() < 0.5) c.hold[p] = { turn: c.turn - 1, before: Math.floor(rnd() * 3), holding: rnd() < 0.7 };
+      if (rnd() < 0.3) c.press[p] = { from: c.turn - 2, until: c.turn + 1 };
+    }
+  }
+  return c;
+}
+// The same position with the seats swapped and the map mirrored: armies keep their ids and units.
+function mirrorImage(c) {
+  const m = structuredClone(c);
+  m.owner = c.owner.map((_, i) => { const o = c.owner[MIRROR[i]]; return o < 0 ? o : 1 - o; });
+  m.armies = c.armies.map(a => ({ ...structuredClone(a), owner: 1 - a.owner, prov: MIRROR[a.prov] }));
+  m.gold = [c.gold[1], c.gold[0]];
+  if (c.hold) m.hold = [c.hold[1], c.hold[0]];
+  if (c.press) m.press = [c.press[1], c.press[0]];
+  return m;
+}
+
+test('AI: the orders for a position and for its mirror image are mirror images (paired-mirror method)', () => {
+  const rnd = rng(2024);
+  let marches = 0;
+  for (let i = 0; i < 4000; i++) {
+    const c = randomPosition(rnd);
+    for (const p of [0, 1]) {
+      const a = structuredClone(c), b = mirrorImage(c);
+      C.aiTurn(a, p); C.aiTurn(b, 1 - p);
+      const orders = Object.entries(a.moves[p]).map(([id, to]) => [id, MIRROR[to]]).sort();
+      assert.deepEqual(Object.entries(b.moves[1 - p]).sort(), orders,
+        `position ${i}, AI seat ${p}: ${JSON.stringify(c.armies.map(x => [x.id, x.owner, x.prov, x.units.length]))}`);
+      assert.equal(a.gold[p], b.gold[1 - p], 'recruiting is the same too');
+      assert.equal(JSON.stringify(a.hold?.[p]), JSON.stringify(b.hold?.[1 - p]), 'the hold counter is the same');
+      assert.equal(JSON.stringify(a.press?.[p]), JSON.stringify(b.press?.[1 - p]), 'the press is the same');
+      if (orders.length) marches++;
+    }
+  }
+  assert.ok(marches > 1000, `only ${marches} of 8000 AI turns gave a march: the comparison would be weak`);
+});
+
+test('AI: the wait after a bounce has no pattern in the turn, the army id or the seat (regression: period 4, complementary seats)', () => {
+  const seq = (p, turns) => {
+    const out = [];
+    for (let turn = 2; turn < 2 + turns; turn++) {
+      const c = setup([[0, 4, units('sword', 8)], [1, 7, units('sword', 8)]]);
+      c.turn = turn; c.bounced = [1, 2];
+      C.aiTurn(c, p);
+      out.push(aiMove(c, p, p + 1) === null ? 1 : 0);   // 1 = waits
+    }
+    return out;
+  };
+  const red = seq(0, 200), blue = seq(1, 200);
+  const rate = s => s.reduce((x, y) => x + y, 0) / s.length;
+  for (const s of [red, blue]) assert.ok(rate(s) > 0.35 && rate(s) < 0.65, `waits ${rate(s)}`);
+  const same = (s, lag) => s.filter((v, i) => i + lag < s.length && v === s[i + lag]).length / (s.length - lag);
+  for (const [name, s] of [['red', red], ['blue', blue]]) {
+    for (const lag of [1, 2, 3, 4, 5, 6, 8]) {
+      assert.ok(same(s, lag) < 0.68, `${name}: the answer repeats at lag ${lag} ${(same(s, lag) * 100).toFixed(0)}% of the time`);
+    }
+  }
+  const agree = red.filter((v, i) => v === blue[i]).length / red.length;
+  assert.ok(agree > 0.32 && agree < 0.68, `the two seats agree on ${(agree * 100).toFixed(0)}% of the turns (exact complements would be 0%)`);
+  assert.deepEqual(seq(0, 200), red, 'deterministic: the same inputs, the same answer');
+});
+
+// ---------- the AI never leaves its capital open (SPEC 5) ----------
+
+test('AI: the garrison does not march out while a second enemy army stands next to the capital (regression: one-turn loss)', () => {
+  for (const ai of [0, 1]) {
+    const cap = C.CAPITAL[ai], [near1, near2] = C.ADJ[cap].filter(n => !C.CAPITAL.includes(n)).slice(0, 2), foe = 1 - ai;
+    // strong garrison (the 70% rule would send it out at once) and a weak one (the third turn would)
+    for (const garrison of [12, 2]) {
+      const c = setup([[ai, cap, units('sword', garrison)], [foe, near1, units('sword', 2)], [foe, near2, units('sword', 2)]]);
+      for (let turn = 1; turn <= 6; turn++) {
+        aiOrders(c, ai);
+        assert.equal(aiMove(c, ai, 1), null, `ai seat ${ai}, garrison ${garrison}, turn ${turn}: stays at home`);
+        assert.equal(c.hold[ai].holding, true, 'and counts as a hold');
+        nextTurn(c);
+      }
+      // the other side walks the second army into the capital: it is defended, not empty
+      aiOrders(c, ai);
+      C.setMove(c, foe, 3, cap);
+      const battles = C.resolveMoves(c);
+      assert.deepEqual(battles.map(b => b.prov), [cap], 'a battle at the capital');
+      assert.equal(armyOf(c, 1).prov, cap, 'the garrison is still home');
+      assert.equal(C.settle(c), true);
+      assert.equal(c.winner, null, 'the capital did not fall');
+    }
+  }
+});
+
+test('AI: the capital rule only looks at armies that can be at the capital next turn, and not at the army it attacks', () => {
+  for (const ai of [0, 1]) {
+    const cap = C.CAPITAL[ai], foe = 1 - ai;
+    const [adj, adj2] = C.ADJ[cap].filter(n => !C.CAPITAL.includes(n));
+    const far = C.PROVS.map((_, i) => i).find(i => i !== C.CAPITAL[foe] && i !== cap && !C.ADJ[cap].includes(i) && C.ADJ[cap].some(n => C.ADJ[n].includes(i)));
+    // one army next to the capital, another two steps away: the garrison attacks the near one at once
+    const one = setup([[ai, cap, units('sword', 12)], [foe, adj, units('sword', 2)], [foe, far, units('sword', 2)]]);
+    aiOrders(one, ai);
+    assert.equal(aiMove(one, ai, 1), adj, `ai seat ${ai}: the second army is two steps away: no danger`);
+    // two armies next to the capital: no sortie, whatever the count of holds so far
+    const two = setup([[ai, cap, units('sword', 12)], [foe, adj, units('sword', 2)], [foe, adj2, units('sword', 2)]]);
+    two.hold = [null, null]; two.hold[ai] = { turn: two.turn - 1, before: 7, holding: true };
+    aiOrders(two, ai);
+    assert.equal(aiMove(two, ai, 1), null);
+    // when one of them goes away the garrison is free to attack the other
+    two.armies = two.armies.filter(a => a.id !== 3);
+    nextTurn(two); aiOrders(two, ai);
+    assert.equal(aiMove(two, ai, 1), adj);
+  }
+});
+
+test('AI: a garrison that waits after a bounce has not attacked: it counts as a hold and starts no press (regression)', () => {
+  for (const ai of [0, 1]) {
+    const cap = C.CAPITAL[ai], foe = 1 - ai, adj = C.ADJ[cap].filter(n => !C.CAPITAL.includes(n))[0];
+    let waited = 0, attacked = 0;
+    for (let turn = 10; turn < 90; turn++) {
+      // 2 units against 4, adjacent, after 2 holds: it must attack, unless the bounce rule makes it wait
+      const c = setup([[ai, cap, units('sword', 2)], [foe, adj, units('sword', 4)]]);
+      c.turn = turn; c.bounced = [1];
+      c.hold = [null, null]; c.hold[ai] = { turn: turn - 1, before: 1, holding: true };
+      C.aiTurn(c, ai);
+      if (aiMove(c, ai, 1) === null) {
+        waited++;
+        assert.deepEqual(c.hold[ai], { turn, before: 2, holding: true }, `turn ${turn}: the wait is a hold`);
+        assert.equal(c.press[ai], null, `turn ${turn}: no press after a wait`);
+      } else {
+        attacked++;
+        assert.equal(c.hold[ai].holding, false);
+        assert.deepEqual(c.press[ai], { from: turn, until: turn + 3 }, 'an attack starts the press');
+      }
+    }
+    assert.ok(waited > 10 && attacked > 10, `ai seat ${ai}: waited ${waited}, attacked ${attacked}`);
+  }
+});
+
+test('AI: while on the press a field army of 5+ does not walk back to the capital (SPEC 5, "unless on the press")', () => {
+  // Blue (capital 12): a host of 8 at Ironridge (7), an enemy army at Saltmarsh (8): two steps from the capital, not
+  // adjacent to the host. Home is nearer (2 steps) than the enemy capital, so the host goes home ...
+  const blue = () => setup([[1, 7, units('sword', 8)], [0, 8, units('sword', 3)]]);
+  const plain = blue();
+  C.aiTurn(plain, 1);
+  assert.ok([9, 10].includes(aiMove(plain, 1, 1)), `not on the press: goes home, got ${aiMove(plain, 1, 1)}`);
+  // ... unless the AI is on the press: then it carries on toward its objective (the enemy capital, by way of Highwold)
+  const pressed = blue();
+  pressed.press = [null, { from: pressed.turn - 1, until: pressed.turn + 2 }];
+  C.aiTurn(pressed, 1);
+  assert.equal(aiMove(pressed, 1, 1), 4, 'on the press: marches on');
+  // the press has run out: home again
+  const over = blue();
+  over.press = [null, { from: over.turn - 4, until: over.turn - 1 }];
+  C.aiTurn(over, 1);
+  assert.ok([9, 10].includes(aiMove(over, 1, 1)));
+  // the other seat: the mirror image of the same position
+  const red = () => setup([[0, 4, units('sword', 8)], [1, 5, units('sword', 3)]]);
+  const redPlain = red();
+  C.aiTurn(redPlain, 0);
+  assert.ok([1, 2].includes(aiMove(redPlain, 0, 1)), `red goes home too, got ${aiMove(redPlain, 0, 1)}`);
+  const redPressed = red();
+  redPressed.press = [{ from: 0, until: 3 }, null];
+  C.aiTurn(redPressed, 0);
+  assert.equal(aiMove(redPressed, 0, 1), 7, 'red on the press marches on');
+  // an army next to an enemy army on the press attacks it (the other half of the rule, unchanged)
+  const adjacent = setup([[0, 2, units('sword', 6)], [1, 4, units('sword', 7)]], { owner: { 4: 1, 5: 0 } });
+  adjacent.press = [{ from: 0, until: 3 }, null];
+  C.aiTurn(adjacent, 0);
+  assert.equal(aiMove(adjacent, 0, 1), 4);
 });
 
 test('AI vs erratic opponent: 200-turn soak with random legal and illegal orders', () => {

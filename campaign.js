@@ -25,6 +25,9 @@ for (const [a, b] of EDGES) { ADJ[a].push(b); ADJ[b].push(a); }
 
 export const COST = { sword: 100, spear: 110, archer: 120, cav: 200 };
 export const START_GOLD = 400, INCOME = 40, MAX_UNITS = 16;
+// The campaign ends after this many turns (endTurn at the limit): the player with more provinces wins,
+// equal counts are a draw. Without it two evenly matched players (or two AIs) could trade drawn battles for ever.
+export const TURN_LIMIT = 100;
 export const REPLENISH = 0.25; // share of full strength a unit regains per turn on home soil
 
 const UNIT_ORDER = ['sword', 'spear', 'archer', 'cav']; // regroup order
@@ -52,6 +55,7 @@ export function newCampaign() {
   const start = () => ['sword', 'sword', 'spear', 'archer'].map(full);
   return {
     owner, turn: 1, gold: [START_GOLD, START_GOLD], winner: null, log: ['The campaign begins.'],
+    endReason: null, // why the campaign ended: 'capital' | 'both_capitals' | 'turn_limit' | 'fault' | 'forfeit' (set by the code that ends it)
     armies: [{ id: 1, owner: 0, prov: 0, units: start() }, { id: 2, owner: 1, prov: 12, units: start() }],
     nextId: 3, moves: [{}, {}], ready: [false, false],
     bounced: [], // ids of armies turned back in the last resolveMoves (read by the AI only)
@@ -187,18 +191,28 @@ export function settle(c) {
     if (a.prov === CAPITAL[1 - a.owner]) fallen[1 - a.owner] = true;
   }
   if (fallen[0] && fallen[1]) {
-    c.winner = -1;
+    c.winner = -1; c.endReason = 'both_capitals';
     c.log.push('Both capitals have fallen: the campaign is a draw.');
   } else if (fallen[0] || fallen[1]) {
-    c.winner = fallen[0] ? 1 : 0;
+    c.winner = fallen[0] ? 1 : 0; c.endReason = 'capital';
     c.log.push(`${SIDE[c.winner]} wins the campaign.`);
   }
   return true;
 }
 
-// Income, then replenishment of units standing on their own soil, then the next turn begins.
+// Income, then replenishment of units standing on their own soil, then the next turn begins. At the turn
+// limit there is no next turn: the campaign ends instead, decided by the provinces each side holds.
 export function endTurn(c) {
   if (!isCamp(c) || c.winner !== null) return false;
+  if (c.turn >= TURN_LIMIT) {
+    const held = [0, 1].map(p => c.owner.filter(o => o === p).length);
+    c.winner = held[0] === held[1] ? -1 : held[0] > held[1] ? 0 : 1;
+    c.endReason = 'turn_limit';
+    c.log.push(c.winner === -1 ? `Turn limit reached: the campaign is a draw (${held[0]} provinces each).`
+      : `Turn limit reached: ${SIDE[c.winner]} wins with more provinces (${held[c.winner]} to ${held[1 - c.winner]}).`);
+    if (c.log.length > LOG_KEEP) c.log = c.log.slice(-LOG_KEEP);
+    return true;
+  }
   for (const p of [0, 1]) c.gold[p] += INCOME * c.owner.filter(o => o === p).length;
   for (const a of c.armies) {
     if (!isSide(a.owner) || c.owner[a.prov] !== a.owner) continue;
@@ -225,9 +239,16 @@ const DIST = PROVS.map((_, from) => {
   return d;
 });
 
-// Breadth-first search from `from` to the nearest other province matching `goal`, walking only through
-// provinces that pass `open`. Returns {step, dist} (step = first province on the way) or null.
-function route(from, goal, open) {
+// The map is mirror-symmetric: province MIRROR[i] is the image of province i (0 <-> 12, 1 <-> 9, 2 <-> 10,
+// 3 <-> 11, 4 <-> 7, 5 <-> 8, 6 fixed), an automorphism of EDGES that also mirrors the coordinates. The AI
+// must not play differently as seat 1 than as seat 0, so every place where it breaks a tie by walking the
+// neighbours of a province uses an order that is the mirror image, for seat 1, of the order for seat 0.
+export const MIRROR = [12, 9, 10, 11, 7, 8, 6, 4, 5, 1, 2, 3, 0];
+const NEIGHBOURS = [ADJ, ADJ.map((_, u) => ADJ[MIRROR[u]].map(v => MIRROR[v]))];
+
+// Breadth-first search for side p from `from` to the nearest other province matching `goal`, walking only
+// through provinces that pass `open`. Returns {step, dist} (step = first province on the way) or null.
+function route(p, from, goal, open) {
   const prev = new Map([[from, -1]]), hops = new Map([[from, 0]]), q = [from];
   for (let i = 0; i < q.length; i++) {
     const u = q[i];
@@ -236,7 +257,7 @@ function route(from, goal, open) {
       while (prev.get(n) !== from) n = prev.get(n);
       return { step: n, dist: hops.get(u) };
     }
-    for (const v of ADJ[u]) {
+    for (const v of NEIGHBOURS[p][u]) {
       if (!prev.has(v) && open(v)) { prev.set(v, u); hops.set(v, hops.get(u) + 1); q.push(v); }
     }
   }
@@ -277,7 +298,10 @@ function sortie(ctx, men) {
   const total = ctx.threats.reduce((s, f) => s + menOf(f), 0);
   if (men < SORTIE_SHARE * total && ctx.before < HOLD_TURNS) { ctx.holding = true; return null; }
   const target = nearestThreat(ctx);
-  const way = route(ctx.cap, x => x === target.prov, () => true);
+  // Never march out while another enemy army (not the one being attacked) stands next to the capital: it
+  // would walk into the empty capital and win the campaign.
+  if (ctx.threats.some(f => f !== target && DIST[ctx.cap][f.prov] <= 1)) { ctx.holding = true; return null; }
+  const way = route(ctx.p, ctx.cap, x => x === target.prov, () => true);
   if (!way) { ctx.holding = true; return null; }
   ctx.attacked = true;
   return way.step;
@@ -288,14 +312,14 @@ function fieldGoal(ctx, a, open, foeMen) {
   const { c, p, cap } = ctx;
   const n = a.units.length;
   const roams = a.prov !== cap || n >= 5; // a small garrison stays home and builds up
-  let goal = n >= 8 ? route(a.prov, x => x === CAPITAL[1 - p], open) : null;
-  if (!goal && roams) goal = route(a.prov, x => c.owner[x] !== p && foeMen(x) === 0, open);
-  // defend the capital when home is nearer than the objective
-  if (a.prov !== cap && n >= 5 && ctx.threats.length && DIST[a.prov][cap] < (goal ? goal.dist : Infinity)) {
-    goal = route(a.prov, x => x === cap, open) || goal;
+  let goal = n >= 8 ? route(p, a.prov, x => x === CAPITAL[1 - p], open) : null;
+  if (!goal && roams) goal = route(p, a.prov, x => c.owner[x] !== p && foeMen(x) === 0, open);
+  // defend the capital when home is nearer than the objective (not while on the press: SPEC 5)
+  if (!ctx.press && a.prov !== cap && n >= 5 && ctx.threats.length && DIST[a.prov][cap] < (goal ? goal.dist : Infinity)) {
+    goal = route(p, a.prov, x => x === cap, open) || goal;
   }
   // nothing left to take: join the largest army, so that small armies cannot idle forever
-  if (!goal && roams && ctx.rally && ctx.rally !== a) goal = route(a.prov, x => x === ctx.rally.prov, open);
+  if (!goal && roams && ctx.rally && ctx.rally !== a) goal = route(p, a.prov, x => x === ctx.rally.prov, open);
   return goal;
 }
 
@@ -313,14 +337,30 @@ function aiStep(ctx, a) {
   // Two armies that turned each other back last turn would do so for ever when both attack again (AI
   // against AI), and a single defender could keep an assault off its capital by marching out on exactly
   // the turns it expects one. So an army that was just turned back waits or attacks again by a fixed
-  // but opaque rule: a hash of the turn, the army and the AI's own gold (which the opponent is not told).
-  if (step !== null && foeMen(step) > 0 && ctx.bounced.has(a.id) && waitsAfterBounce(c, p, a)) return null;
+  // but opaque rule: a hash of the turn, the army, the AI's own gold (which the opponent is not told) and its seat.
+  if (step !== null && foeMen(step) > 0 && ctx.bounced.has(a.id) && waitsAfterBounce(c, p, a)) {
+    // a garrison that waits has not attacked: it counts as a hold, and no press starts (SPEC 5)
+    if (a.prov === ctx.cap && ctx.threats.length) { ctx.holding = true; ctx.attacked = false; }
+    return null;
+  }
   return step;
 }
 
+// murmur3's 32-bit finalizer: every input bit changes about half of the output bits.
+function mix32(h) {
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+// The same turn, army, gold and seat always give the same answer, but no pattern in the turn number (or the
+// army id, or the seat) shows through, and the seats are not mirror images of each other.
 function waitsAfterBounce(c, p, a) {
-  const h = Math.imul(c.turn * 31 + a.id, 2654435761) ^ c.gold[p];
-  return ((h >>> 15) & 1) === 1;
+  let h = mix32(c.turn | 0);
+  h = mix32(h ^ ((a.id + 0x9e3779b9) | 0));
+  h = mix32(h ^ (c.gold[p] | 0));
+  h = mix32(h ^ ((p + 0x7f4a7c15) | 0));
+  return (h & 1) === 1;
 }
 
 function aiOrders(c, p) {

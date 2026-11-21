@@ -68,7 +68,7 @@ characters `A-Z0-9`, case-insensitive on input.
 |---|---|
 | `{t:'room', code, phase, mode, you, token, players:[{name, ready, bot, connected, grace?}]}` | Room state. `you` = your seat index (0 or 1), `token` = YOUR secret seat token (never another seat's). `connected:false` + `grace` (whole seconds left) while a seat is waiting for a rejoin. Sent whenever seats, ready flags, connectivity or the lobby/over phase change, and first after any successful create / join / rejoin. |
 | `{t:'left', reason?}` | You are no longer in a room. `reason`: `'leave'`, `'idle'`, `'closed'`. |
-| `{t:'error', msg, code?}` | `code`: `'bad_room'`, `'server_full'`, `'rejoin_failed'`, `'rate'`, `'shutdown'`. `msg` is plain text for the player. `'rate'` also answers a `join` from an address that has failed too many joins (7.2). |
+| `{t:'error', msg, code?}` | `code`: `'bad_room'`, `'server_full'`, `'too_many_rooms'`, `'rejoin_failed'`, `'rate'`, `'shutdown'`. `msg` is plain text for the player. `'too_many_rooms'` answers a `create` / `practice` from an address that already owns its share of rooms (7.2): "You already have several games open from this connection. Close one first." `'rate'` is sent for a message over the per-connection budget ("Too many messages. Slow down.") and also answers a `join` from an address that has named too many rooms that do not exist (7.2): "Too many wrong room codes. Wait a minute and try again." |
 | `{t:'start', you, W, H, types, limit, startMen}` | A battle begins, or you rejoined one. `limit` = time limit in seconds. `startMen` = object mapping each regiment id (as a string, `"1"`...) to its integer men at the start of this battle, for both sides (the denominator of the unit cards). It is the same object again when the `start` is a resync after a rejoin, whatever the regiments have lost since. |
 | `{t:'snap', time, left, regs}` | 20 per second while the battle runs. `left` = whole seconds until the time limit. `regs` = array of `[id, owner, type, x, y, face, men, morale, state, ammo, engagedId]` (layout unchanged from v1). |
 | `{t:'end', winner, reason, forfeit?}` | Battle finished, or the whole game ended by forfeit. `winner`: `0`, `1` or `-1` (draw). `reason`: `'rout'`, `'timeout'`, `'forfeit'`. `forfeit:true` exactly when `reason==='forfeit'`. A human who may have missed it is sent it again, once, right after the `room` of its next `rejoin` (7.3); a client therefore has to accept an `end` after a `room`, also when it is already showing that result. `winner` is numbered as the seat is numbered in the `room` that precedes it. |
@@ -173,7 +173,8 @@ bot beats a passive opponent; determinism.
 
 Keep it pure. Keep exports `PROVS`, `CAPITAL`, `EDGES`, `ADJ`, `COST`, `START_GOLD`, `INCOME`, `MAX_UNITS`,
 `newCampaign`, `totalUnits`, `recruit`, `setMove`, `resolveMoves`, `applyBattle`, `settle`, `endTurn`,
-`aiTurn`. Add `REPLENISH = 0.25` and `regroup(units)`.
+`aiTurn`. Add `REPLENISH = 0.25` and `regroup(units)`, `TURN_LIMIT = 100` and `MIRROR` (the AI's province mirror map,
+below).
 
 - **P0 Validation.** Every mutator validates its arguments (integers in range, own keys only via
   `Object.hasOwn`, ownership) and returns `false` without mutating on bad input; none may throw. Defect
@@ -193,9 +194,19 @@ Keep it pure. Keep exports `PROVS`, `CAPITAL`, `EDGES`, `ADJ`, `COST`, `START_GO
 - **P0 `settle(c)`**: an army alone in a province takes it. Taking the enemy capital wins. If both capitals
   fall in the same turn the campaign is a draw (`winner = -1`). Defect fixed: remove the old rule that
   declared a player with no armies and little gold the loser (they still earn income and can recruit).
+- **End reason.** The campaign object has `endReason`, `null` while it runs, and set by whatever ends it:
+  `'capital'` (`settle`: one capital taken), `'both_capitals'` (`settle`: both taken in one turn, a draw),
+  `'turn_limit'` (`endTurn`, below), `'fault'` (the server ended it as a draw after a fault, 7.2) and
+  `'forfeit'` (a seat left a running campaign: recorded on the campaign that is then discarded, so no campaign
+  view carries it, 7.3). It is sent to the clients in the campaign view (7.6).
 - **P0 `endTurn(c)`**: income as today, then replenishment: every unit of an army standing in a province
   owned by its own player regains `ceil(REPLENISH * max)` men, capped at max; then `turn++`, ready reset,
   log trimmed.
+- **Turn limit.** `TURN_LIMIT = 100`. When `endTurn` is called on turn `TURN_LIMIT` (the counter would pass it)
+  the campaign ends instead of moving on, with no income and no replenishment: the player who owns more
+  provinces wins, equal counts are a draw (`winner = -1`), `endReason = 'turn_limit'`, and the log says so. It
+  returns `true`. A caller must look at `winner` after `endTurn`. Without a limit two evenly matched players
+  (or two AIs) could trade drawn battles for ever.
 - **P1 AI (`aiTurn`)**: recruit at the capital as today. The army at its own capital ("the garrison") holds
   while an enemy army is within 2 steps of that capital, but at most 2 turns in a row; on the third it
   attacks the nearest enemy army (the first step toward it) whatever the odds. It also attacks at once, with
@@ -207,11 +218,27 @@ Keep it pure. Keep exports `PROVS`, `CAPITAL`, `EDGES`, `ADJ`, `COST`, `START_GO
   enemy capital; smaller: take the nearest province that is not its own and has no enemy army), but never
   step into a province holding an enemy army with more men than itself unless the AI army has 12+ units.
   An army that was turned back by a crossing last turn waits or attacks again by a deterministic hash of the
-  turn, the army id and the AI's own gold (not by turn parity, which an opponent could learn and time a
-  counter-march against). Deterministic. Never throws. Never leaves the game unable to progress: a passive
+  turn, the army id, the AI's own gold and its seat, mixed with murmur3's 32-bit finalizer so that no pattern
+  in any of them shows through (not by turn parity, which an opponent could learn and time a counter-march
+  against). Deterministic. Never throws. Never leaves the game unable to progress: a passive
   enemy parked two steps from the AI capital is engaged within a few turns, and a lone garrison cannot keep
   a host off its capital for ever. The AI keeps its counters in the campaign object (`c.hold`, `c.press`),
   keyed by turn, so asking for the same turn's orders twice changes nothing.
+- **The AI never leaves its capital open.** The garrison does not march out (it holds, which counts toward
+  its two held turns) while an enemy army other than the one it would attack stands within one step of the
+  capital, because that army would walk into the empty capital and win. This applies to both ways out: the
+  immediate attack with 70% of the men and the attack after the two held turns. So a human with two armies
+  next to the AI capital cannot lure the garrison out; a single passive army (or one next to the capital
+  with another two steps away) is still attacked as before. A garrison that only waits because of the
+  bounce rule has not attacked: it counts as a hold and starts no press. While the AI is "on the press" its
+  field armies of 5+ units do not walk back to the capital.
+- **The AI favours neither seat.** The map is mirror-symmetric: `MIRROR = [12, 9, 10, 11, 7, 8, 6, 4, 5, 1, 2,
+  3, 0]` (province `i` is the image of province `MIRROR[i]`) is an involution, a graph automorphism of
+  `EDGES` and mirrors the province coordinates (`x -> 1000 - x`). Wherever the AI breaks a tie by the order
+  in which it visits the neighbours of a province (its route search), seat 1 visits them in the mirror
+  image of seat 0's order, so the orders for a position and for its mirror image (seats swapped, provinces
+  mirrored) are mirror images of each other. (A harness that calls `aiTurn(c, 0)` before `aiTurn(c, 1)`
+  still gives seat 1 a look at seat 0's fresh recruits; call them in random order when measuring.)
 
 Tests (`test/campaign.test.mjs`): validation incl. prototype keys; bounce; merge; battle list + defender;
 regroup conserves men; draw removes both; capture and capital win; double capital capture = draw; income;
@@ -219,19 +246,23 @@ replenish only at home and capped; no premature elimination; `setMove` return va
 with battles auto-resolved by a simple strength comparison in the test (no throw, gold never negative or NaN,
 unit cap respected); the garrison holds at most 2 turns; a passive enemy two steps from the AI capital is
 engaged or something is captured within 8 turns; a lone garrison counter-marching on any fixed pattern cannot
-stop an assault for ever.
+stop an assault for ever; the turn limit and the end reasons; `MIRROR` is a symmetry of the map; the AI's orders
+for 4000 random positions and their mirror images are mirror images (paired-mirror method); the bounce wait
+has no period and the seats' waits are not complements; the capital is never left open; a waiting garrison
+starts no press; a pressed field army does not walk home.
 
 ## 6. lib/http.js and lib/limits.js (NET track)
 
 ```
 // lib/http.js
-export function createHttpHandler({ publicDir, getStats }) -> (req, res) => void
+export function createHttpHandler({ publicDir, getStats, cacheStatic = true, trustProxy = 0, rate = null }) -> (req, res) => void
 // lib/limits.js
 export function createTokenBucket(capacity, refillPerSec, now = Date.now) -> { take(n = 1): boolean }
 export function clientIp(req, trustProxy) -> string      // see below
 export function proxyHops(trustProxy) -> number          // false/undefined/0 -> 0, true -> 1, positive integer N -> N, else 0
 export function createIpCounter(maxPerIp) -> { add(ip): boolean, remove(ip): void, count(ip): number }
-export function createFailureThrottle(max, windowMs, now = Date.now) -> { blocked(key), fail(key), prune(), size() }
+export function createFailureThrottle(max, windowMs, now = Date.now) -> { blocked(key), fail(key), forgive(key), prune(), size() }
+export function createKeyedBuckets(capacity, refillPerSec, maxKeys = 10000, now = Date.now) -> { take(key): boolean, size() }
 ```
 
 `clientIp(req, trustProxy)`: `trustProxy` is `false` (the socket address), `true` (= 1 trusted proxy) or a
@@ -241,13 +272,22 @@ connection from, so the entries on the left may be anything the client wrote, an
 the right is the first one that was not written by the client. With fewer than N entries, or when that
 entry is not an IP address, the socket address is used. No other header (`CF-Connecting-IP`, `X-Real-IP`,
 `Forwarded`) is believed. The result is a key, never empty (`'unknown'` at worst), lower-case, without port or
-brackets: an IPv4-mapped IPv6 address is the IPv4 address, any other IPv6 address is its /64 prefix as four
-hex groups without leading zeros (`2001:db8:1:1`), so one subscriber cannot multiply connections by rotating
-inside its /64, and the different spellings of one address are one key.
+brackets: an IPv4-mapped IPv6 address is the IPv4 address, any other IPv6 address is its /56 prefix as four
+hex groups without leading zeros, the fourth masked to its top byte (`2001:db8:1:0` for `2001:db8:1:1::a`), so one
+subscriber (who holds a /64, a /56 or more) cannot multiply connections by rotating through its prefix, and the
+different spellings of one address are one key.
 
 `createFailureThrottle`: `blocked(key)` is true once `max` failures were recorded less than `windowMs` ago,
-until the oldest of them ages out. At most `max` timestamps are kept per key and at most 10000 keys; `prune()`
-drops expired keys. A bad configuration blocks (denies) rather than throwing.
+until the oldest of them ages out; `forgive(key)` wipes the failures of one key. At most `max` timestamps are
+kept per key and at most 10000 keys. The table is kept in order of each key's latest failure, so `fail()` drops
+expired keys from the front only (amortised: it never rescans the table) and, when the table is still full,
+evicts the oldest key, preferring one that is not blocked; `prune()` drops every expired key and is called from
+a timer. A bad configuration blocks (denies) rather than throwing.
+
+`createKeyedBuckets(capacity, refillPerSec, maxKeys)`: one token bucket per key (a client address), for limits on
+requests rather than messages. At most `maxKeys` (10000) buckets; when the table is full, buckets that have been
+idle long enough to be full again are dropped from the front (kept in order of last use), and then the least
+recently used one. Bad configuration denies.
 
 HTTP handler, all P0:
 
@@ -259,10 +299,23 @@ HTTP handler, all P0:
   (optionally `getStats()` as JSON when `?stats` is asked; never touches the disk).
 - Resolve inside `publicDir` only: the normalised absolute path must equal `publicDir + path.sep + rest`
   (a sibling such as `public-old/` must not match). No directory listings. Any path segment starting with
-  `.` -> `404`. Regular files only. Use async fs; missing -> `404 text/plain`.
+  `.` -> `404`. Regular files only; missing -> `404 text/plain`.
+- **Static files are served from memory.** At start-up (when the handler is created) `publicDir` is scanned
+  recursively and every regular file is read once (dot-files and dot-directories, names that fail the segment
+  rule, symlinks and junctions, files over 8 MiB and everything past 64 MiB in total are skipped). Each entry holds
+  the body, its content type, a strong ETag (a hash of the content) and the headers below. A request is a table
+  lookup: an unknown path is `404` without touching the disk, and a file that changed or appeared after
+  start-up is not seen until the process restarts. `If-None-Match` (a list of tags, `W/` ignored, or `*`) is
+  answered `304` with the headers and no body. HEAD works. `cacheStatic: false` reads the file from the disk on
+  every request instead (the per-request path rules are unchanged); tests that change files under a running
+  server use it, or create their files before the server starts.
+- **Request limit.** With `rate = { capacity, refillPerSec }` every request except `GET`/`HEAD /healthz` takes a
+  token from a bucket kept per `clientIp(req, trustProxy)`; with none left the answer is `429`, `Retry-After: 1`,
+  a short plain-text body, and the usual headers. Without `rate` there is no limit. The game server turns it on
+  (40 burst, 20 per second, 7.1).
 - Headers on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
   `X-Frame-Options: DENY`, `Cache-Control: no-cache`. Text types carry `; charset=utf-8`. Set
-  `Content-Length`. HTML also gets `Content-Security-Policy: default-src 'self'; script-src 'self';
+  `Content-Length`. Files also carry `ETag`. HTML also gets `Content-Security-Policy: default-src 'self'; script-src 'self';
   style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none';
   form-action 'none'; frame-ancestors 'none'`.
 - `public/robots.txt`: `User-agent: *` / `Disallow: /`.
@@ -305,10 +358,16 @@ Options (all optional; tests shrink the timers):
 | `idleRoomMs` | 45 * 60000 | Rooms with no client activity for this long are closed. |
 | `unseatedIdleMs` | 5 * 60000 | A socket in no room that sent nothing but `ping` for this long is closed (1008, `Idle`). |
 | `maxRooms` | 60 | Rooms in memory (lobbies and games). Chosen from a CPU measurement, see the README. |
+| `maxRoomsPerIp` | 4 | Rooms (connected or not) one client address may own at a time (7.2). |
+| `lobbyMaxMs` | 15 * 60000 | A lobby with fewer than two humans whose seats have not changed for this long is closed (7.2). |
 | `maxConnections` | 500 | |
 | `maxPerIp` | 20 (40 behind a proxy) | Connections per client address; a proxy's address may stand for many players. |
 | `joinFails` / `joinWindowMs` | 8 / 60000 | Failed joins per address per window before joins are answered `rate` (7.2). |
 | `rate` | `{capacity: 60, refillPerSec: 30}` | Per-connection message budget. |
+| `httpRate` | `{capacity: 40, refillPerSec: 20}` | HTTP requests per client address, `/healthz` excepted (6, 7.2). |
+| `upgradeRate` | `{capacity: 10, refillPerSec: 2}` | WebSocket upgrades per client address (7.2). |
+| `allowedOrigins` | `ALLOWED_ORIGINS`, else none | Full origins (array or comma-separated string) besides the server's own that may open a WebSocket (7.2). |
+| `cacheStatic` | `true` | Serve the public files from memory (6). |
 | `trustProxy` | `TRUST_PROXY_HOPS`, else 1 on Render (`RENDER` set), else 0 | Number of proxies of our own in front of the server (`false` = 0, `true` = 1, an integer N), see 6. |
 | `log` | `console.log` | Logger function; tests pass a no-op. |
 | `publicDir` | `./public` next to server.js | |
@@ -316,7 +375,8 @@ Options (all optional; tests shrink the timers):
 Environment variables (read by `createGameServer` for the options that were not passed, so they also apply
 when run directly; an option passed in code always wins; a value that is not a valid integer is ignored):
 `TRUST_PROXY_HOPS` (integer >= 0; default 1 when `RENDER` is set, else 0 = off), `MAX_ROOMS`,
-`MAX_CONNECTIONS`, `MAX_PER_IP` (positive integers). The first connection that carries an `X-Forwarded-For`
+`MAX_CONNECTIONS`, `MAX_PER_IP`, `MAX_ROOMS_PER_IP` (positive integers) and `ALLOWED_ORIGINS` (comma-separated full
+origins such as `https://example.com`; entries that are not origins are ignored). The first connection that carries an `X-Forwarded-For`
 header logs one line with the (bounded, printable-only) header and the client it was counted as, or a
 warning when `TRUST_PROXY_HOPS` is 0, so a wrong hop count shows up on the first visit.
 
@@ -335,7 +395,7 @@ warning when `TRUST_PROXY_HOPS` is 0, so a wrong hop count shows up on the first
   battle in a room that was back in the lobby.
 - Limits: `maxPayload` 4096; connection refused (close code 1013) beyond `maxConnections` or `maxPerIp`
   (per client address as `clientIp` computes it, 6); `create` / `practice` beyond `maxRooms` -> `error`
-  `server_full`; per-connection token bucket: a message over budget is dropped, and a connection that has
+  `server_full`, and beyond `maxRoomsPerIp` rooms of the same address -> `error` `too_many_rooms` (below); per-connection token bucket: a message over budget is dropped, and a connection that has
   more than 200 messages dropped is closed with code 1008.
 - **Capacity is never made by destroying somebody's room.** A room is only destroyed by its own timers (grace
   expiry, idle expiry), an explicit leave, or a fault. The room records the address that created it
@@ -343,12 +403,32 @@ warning when `TRUST_PROXY_HOPS` is 0, so a wrong hop count shows up on the first
   creates or starts a practice room while already owning 4, THAT address's oldest abandoned room is
   destroyed first. Another address's room, and any room with a connected human, is never touched, so a
   reload or a network blip is always covered by the grace period; at `maxRooms` the answer is `server_full`.
+- **Rooms per address.** Rooms are counted by `room.ip` whether or not a human is connected. `create` and
+  `practice` (campaign rooms too) are refused once the address owns `maxRoomsPerIp` (4) rooms, with `error`
+  `too_many_rooms`: "You already have several games open from this connection. Close one first." Before
+  refusing, if some of that address's rooms are abandoned, its oldest abandoned one is destroyed and the create
+  goes on. So a few addresses cannot pin every room slot with sockets that do nothing. The check comes before the
+  `maxRooms` check; another address's room is never evicted.
+- **Lobby expiry.** A lobby (phase `lobby`) with fewer than two humans whose seat set has not changed for
+  `lobbyMaxMs` (15 minutes) is destroyed with `left` / `reason: 'idle'` however much `ping`, `ready` or other
+  traffic it gets (a seat is added by `join`, removed by a leave or grace expiry, and the room reset after a
+  game also restarts the clock). Idle expiry (below) stays for everything else.
 - **Unseated sockets.** A socket that is in no room (never joined one, or left / was removed from one) and
   sends no message other than `ping` for `unseatedIdleMs` (5 minutes) is closed with code 1008, reason
   `Idle`. Seated sockets are never closed by this; their rooms have idle expiry and the heartbeat.
-- **Room-code guessing.** Room codes stay 4 characters. After 8 failed joins (answers `bad_room`) from one
-  address within 60 s, further `join` messages from that address are answered with `error` code `rate`,
-  without any room lookup, until fewer than 8 failures remain inside the window.
+- **Room-code guessing.** Room codes stay 4 characters. Only a `join` of a code that does not exist counts as a
+  failure (a room that exists but is full or already started does not); after 8 failures from one address within
+  60 s, further `join` messages from that address are answered with `error` code `rate` ("Too many wrong room
+  codes. Wait a minute and try again."), without any room lookup, until fewer than 8 failures remain inside the
+  window. A successful `join` clears that address's failures.
+- **WebSocket upgrades.** Each upgrade takes a token from a per-address bucket (`upgradeRate`: 10 burst, 2 per
+  second; `clientIp` as above). With none left the server writes `HTTP/1.1 429` with `Retry-After: 1` to the raw
+  socket and destroys it before any handshake work. Then the `Origin` header is checked: when present, its host
+  (including a non-default port) must equal the request's `Host` header, ignoring case, or the origin must be in
+  `allowedOrigins`; otherwise the upgrade is refused with `403` and the socket closed. A missing `Origin` is
+  allowed (scripts, tests, other non-browser clients); an `Origin` that is not an http(s) origin (`null`,
+  garbage, a path, user info) is refused. A page of another site therefore cannot use its visitors' browsers to
+  open sockets here. If the platform rewrites the `Host` header, list the public origin in `ALLOWED_ORIGINS`.
 - Heartbeat: every `heartbeatMs` ping each socket; a socket that did not answer the previous ping is
   terminated (which then follows the normal seat-lost path).
 - Idle expiry: a room with no client message other than `ping` for `idleRoomMs` is closed: its players get
@@ -393,7 +473,8 @@ scope, keep tokens + grace + rejoin for running games)
   draw) every human seat is owed the `end` message; when the other player forfeits while a seat is away, that
   seat is owed `{t:'end', winner:<its seat as numbered after the reset: 0>, reason:'forfeit', forfeit:true}`.
   A socket can die without the server noticing for a while, so "away" includes a seat that is still counted
-  as connected when the result goes out. The owed message is sent once, immediately after the `room` of the
+  as connected when the result goes out: for a forfeit the debt is recorded for the staying seat in every case,
+  and the `end` is still sent live when it has a socket. The owed message is sent once, immediately after the `room` of the
   next `rejoin` (state sync, 2.3), and the debt is cleared when it is sent, when the seat sends `ready` for the
   rematch, and when the next game starts or the room resets to the lobby. A reload on the result screen
   therefore shows the result again, once. Campaign results are not owed this way: they are in the `camp` view
@@ -436,8 +517,15 @@ in `lobby` with a free seat. Battle orders (`move`, `moves`, `attack`, `stop`) a
   armies:[{id, owner, prov, units:[{type, men}]}],
   moves,                                       // YOUR pending marches {armyId: provinceIndex}
   ready:[bool, bool], log:[last 8 strings], opponent,
-  deadline: null | { who, left } }             // seat that must end its turn, whole seconds left
+  deadline: null | { who, left },              // seat that must end its turn, whole seconds left
+  turnLimit,                                   // integer: C.TURN_LIMIT (100); the campaign ends when turn `turnLimit` is over
+  endReason }                                  // null while it runs, else 'capital' | 'both_capitals' | 'turn_limit' | 'fault' | 'forfeit'
 ```
+
+At the turn limit the campaign ends (5): `winner` is the player with more provinces, or `-1`, `phase` is `over`,
+`endReason` is `'turn_limit'`. `endReason` is set exactly when `winner` is not `null`. `'forfeit'` is recorded on the
+campaign when a seat leaves a running campaign, but that campaign is discarded at once, so no `camp` message carries
+it; the staying player is told by `end` (7.3).
 
 Never send one player's pending `moves` or `gold` to the other.
 

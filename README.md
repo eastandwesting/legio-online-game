@@ -60,6 +60,11 @@ Needs Node 20 or newer. The only dependency is `ws`.
   clearly more of its army than the attacker (see above). The loser's army is removed. Take the enemy
   capital to win; both capitals falling in one turn is a draw.
 - If one human ends their turn and the other stalls, a 90-second hurry-up timer ends it for them.
+- The campaign lasts at most 100 turns. When turn 100 ends, the player who owns more provinces wins; equal
+  counts are a draw. (The campaign view the server sends carries `turnLimit` and, once it is over, `endReason`:
+  `capital`, `both_capitals`, `turn_limit`, `fault` or `forfeit`.)
+- The AI opponent never marches its capital garrison out while a second army of yours stands next to the
+  capital, and it plays Red and Blue alike (its route choices are mirror images of each other).
 
 ## Layout
 
@@ -87,7 +92,7 @@ land on different instances and never meet.
 - **Anything with Docker** (Fly.io, Railway, a VPS): use the `Dockerfile`; it listens on `PORT`.
 - **Behind a proxy, set `TRUST_PROXY_HOPS`** to the number of proxies in front of the app (1 on Render, where it
   is the default; 0 = none, the default everywhere else). The per-address limits count players by their
-  address, and behind a proxy the socket address is the proxy's. With N hops the address is taken from the
+  address (an IPv6 client by its /56 prefix), and behind a proxy the socket address is the proxy's. With N hops the address is taken from the
   N-th entry of `X-Forwarded-For` counted from the right. Each proxy appends the address it received the
   connection from to that header, so the entries on the left are whatever the client wrote and can be
   forged one per connection; the rightmost entries were added by your own proxies and can be trusted.
@@ -109,15 +114,31 @@ a positive integer is ignored):
 | Rooms (lobbies and games) | 60 | `MAX_ROOMS` |
 | Connections | 500 | `MAX_CONNECTIONS` |
 | Connections per address | 20 (40 behind a proxy: a proxy address can stand for many players) | `MAX_PER_IP` |
+| Rooms per address (connected or not) | 4: a fifth `create` / `practice` gives up that address's own oldest abandoned room, or is answered `too_many_rooms` | `MAX_ROOMS_PER_IP` |
+| Lobby with fewer than two players | closed after 15 minutes without a change of seats, whatever traffic it gets | |
+| HTTP requests per address (not `/healthz`) | 40 at once, then 20 a second; over that: `429` with `Retry-After: 1` | |
+| WebSocket upgrades per address | 10 at once, then 2 a second; over that: `429` before any handshake | |
+| WebSocket from another site | refused (`403`) unless its `Origin` is the server's own host or listed | `ALLOWED_ORIGINS` (comma-separated, e.g. `https://example.com`) |
 | Message burst per connection | 60, refilling 30 a second | |
 | Sockets in no room that only ping | closed after 5 minutes | |
 | Abandoned rooms per address | 4 (the fifth create drops that address's oldest) | |
-| Failed joins per address | 8 a minute, then joins are answered `rate` | |
+| Failed joins per address (a code that does not exist) | 8 a minute, then joins are answered `rate`; a successful join clears the count | |
 
 When the server is full, `create` and `practice` are answered `server_full`; a room is never destroyed to
-make space for someone else's, so a player who reloads keeps their game (their seat is held for the grace
+make space for someone else's, and one address cannot take more than its few rooms (a lobby nobody joins is
+closed after 15 minutes), so a player who reloads keeps their game (their seat is held for the grace
 period: 60 seconds, as an allowance that refills slowly in a running game against another human, and in full
 for every drop in the lobby or against the AI).
+
+The public files are read into memory when the server starts and sent with a strong `ETag` (a repeat request is
+answered `304`); a file changed on disk is not served until the process restarts. Measured on a development
+desktop, the CPU per request fell from about 0.3 to 0.4 ms (read from disk each time) to about 0.03 ms for
+`client.js` and 0.02 ms for an unknown path.
+
+The WebSocket `Origin` check compares the page's host with the `Host` header the server receives. On Render and
+behind Cloudflare that is normally the public hostname; if your platform
+rewrites `Host`, put the public origin in
+`ALLOWED_ORIGINS`.
 
 Why 60 rooms: measured on a development desktop, a practice battle costs 0.02 to 0.05 ms of CPU per 50 ms tick
 (simulation, bot, snapshot and send; 25 to 200 concurrent battles; 200 battles used about 8% of one core).

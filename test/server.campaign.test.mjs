@@ -32,8 +32,10 @@ test('campaign against the AI: view contents, battles inside the turn flow, comp
 
   const first = await a.next('camp');
   assert.deepEqual(Object.keys(first).sort(), ['armies', 'capital', 'cost', 'deadline', 'edges', 'gold', 'income', 'log', 'maxUnits',
-    'moves', 'opponent', 'owner', 'phase', 'provs', 'ready', 'replenish', 't', 'turn', 'types', 'units', 'winner', 'you'].sort());
+    'moves', 'opponent', 'owner', 'phase', 'provs', 'ready', 'replenish', 't', 'turn', 'turnLimit', 'types', 'units', 'winner', 'you',
+    'endReason'].sort());
   assert.deepEqual([first.you, first.turn, first.phase, first.winner, first.deadline], [0, 1, 'orders', null, null]);
+  assert.deepEqual([first.turnLimit, first.endReason], [100, null], 'turnLimit is an integer, endReason is null while the campaign runs');
   assert.deepEqual([first.income, first.units, first.maxUnits, first.replenish], [40, 4, 16, 0.25]);
   assert.equal(first.gold, 400);
   assert.equal(first.cost.cav, 200);
@@ -59,7 +61,8 @@ test('campaign against the AI: view contents, battles inside the turn flow, comp
       ends++;
       assert.ok([0, 1, -1].includes(m.winner) && ['rout', 'timeout'].includes(m.reason));
     } else {
-      assert.ok(m.turn <= 60, 'the campaign ends in reasonable time');
+      assert.ok(m.turn <= 100, 'the campaign ends by the turn limit at the latest');
+      assert.equal(m.endReason === null, m.winner === null, 'endReason is set exactly when the campaign is over');
       assert.ok(m.log.length <= 8);
       assert.ok(m.deadline === null, 'no hurry-up timer against the AI');
       last = m;
@@ -69,7 +72,8 @@ test('campaign against the AI: view contents, battles inside the turn flow, comp
   }
   assert.equal(final.phase, 'over');
   assert.ok([0, 1, -1].includes(final.winner));
-  if (final.winner >= 0) assert.equal(final.owner[final.capital[1 - final.winner]], final.winner, 'the winner holds the enemy capital');
+  assert.ok(['capital', 'both_capitals', 'turn_limit'].includes(final.endReason), final.endReason);
+  if (final.endReason === 'capital') assert.equal(final.owner[final.capital[1 - final.winner]], final.winner, 'the winner holds the enemy capital');
   assert.ok(starts >= 1 && starts === ends, `battles started ${starts}, ended ${ends}`);
   const over = await a.next('room');
   assert.equal(over.phase, 'over');
@@ -410,4 +414,64 @@ test('an order that changes nothing costs no broadcast: no-op cmoves and refused
   a.send({ t: 'recruit', prov: 0, type: 'sword' });         // recruiting always changes something
   assert.equal((await a.next('camp')).units, 5);
   assert.deepEqual(s.logs, []);
+});
+
+// ---- turn limit and end reasons (SPEC 2.2, 5, 7.6) ----
+
+test('the campaign ends at the turn limit: more provinces win, equal is a draw, endReason says why', async t => {
+  const s = await server(t, { resolveDelayMs: 1 });
+  const { a, b, code } = await pair(s, 'campaign');
+  const [first] = await readyBoth(a, b, 'camp');
+  assert.deepEqual([first.turnLimit, first.endReason, first.turn], [100, null, 1]);
+  const room = s.game._rooms.get(code);
+  // equal provinces (4 each): a draw
+  room.camp.turn = first.turnLimit;
+  a.send({ t: 'endturn' }); b.send({ t: 'endturn' });
+  const over = await a.next(m => m.t === 'camp' && m.winner !== null);
+  assert.deepEqual([over.winner, over.phase, over.endReason, over.turn, over.turnLimit], [-1, 'over', 'turn_limit', 100, 100]);
+  assert.match(over.log.at(-1), /Turn limit reached/);
+  assert.equal((await b.next(m => m.t === 'camp' && m.winner !== null)).endReason, 'turn_limit');
+  assert.equal((await a.next('room')).phase, 'over');
+  // orders after the end are ignored
+  a.send({ t: 'endturn' });
+  await a.flush();
+  assert.deepEqual(quiet(a), []);
+
+  // a rematch: the second seat holds more provinces at the limit and wins
+  const [fresh] = await readyBoth(a, b, m => m.t === 'camp' && m.winner === null);
+  assert.deepEqual([fresh.turn, fresh.endReason], [1, null], 'a new campaign starts clean');
+  const camp2 = s.game._rooms.get(code).camp;
+  camp2.turn = fresh.turnLimit;
+  camp2.owner[6] = 1; camp2.owner[7] = 1;
+  a.send({ t: 'endturn' }); b.send({ t: 'endturn' });
+  const won = await b.next(m => m.t === 'camp' && m.winner !== null);
+  assert.deepEqual([won.winner, won.endReason], [1, 'turn_limit']);
+  assert.match(won.log.at(-1), /Blue wins/);
+  assert.deepEqual(s.logs, []);
+});
+
+test('a campaign that ends by capture says so: endReason capital', async t => {
+  const s = await server(t, { resolveDelayMs: 1 });
+  const { a, b, code } = await pair(s, 'campaign');
+  await readyBoth(a, b, 'camp');
+  const c = s.game._rooms.get(code).camp;
+  // Red's army is next to the (empty of armies) Blue capital: walk in
+  c.armies.find(x => x.owner === 0).prov = 9;
+  c.armies.find(x => x.owner === 1).prov = 11;
+  a.send({ t: 'cmove', army: 1, to: 12 });
+  a.send({ t: 'endturn' }); b.send({ t: 'endturn' });
+  const over = await a.next(m => m.t === 'camp' && m.winner !== null);
+  assert.deepEqual([over.winner, over.endReason, over.phase], [0, 'capital', 'over']);
+});
+
+test('a forfeit during a campaign is recorded on the discarded campaign (endReason forfeit); the wire carries the end message', async t => {
+  const s = await server(t);
+  const { a, b, code } = await pair(s, 'campaign');
+  await readyBoth(a, b, 'camp');
+  const camp = s.game._rooms.get(code).camp;
+  a.send({ t: 'leave' });
+  await a.next('left');
+  assert.deepEqual(await b.next('end'), { t: 'end', winner: 1, reason: 'forfeit', forfeit: true });
+  assert.deepEqual([camp.winner, camp.endReason], [1, 'forfeit']);
+  assert.equal(s.game._rooms.get(code).camp, null, 'and the room has no campaign left');
 });

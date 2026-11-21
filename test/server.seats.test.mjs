@@ -444,3 +444,43 @@ test('a decisive result is owed with the winner as numbered in that game', async
   await b2.next('room');
   assert.deepEqual(await b2.next('end'), endA, 'owed with the winner as numbered in that game');
 });
+
+test('a forfeit win is owed to a seat whose socket is dead but not yet noticed (regression: the debt was only kept for a seat already lost)', async t => {
+  const s = await server(t, { graceMs: 3000 });
+  const { a, b, code, roomA } = await pair(s);
+  await readyBoth(a, b, 'start');
+  a.ws._socket.pause();                           // Ann's link silently dies: the server still counts her as connected
+  b.send({ t: 'leave' });
+  await b.next('left');
+  const room = s.game._rooms.get(code);
+  assert.equal(room.phase, 'lobby');
+  assert.ok(room.seats[0].ws, 'the server has not noticed: the seat still has a socket');
+  const a2 = await rejoin(s, code, roomA.token);   // she reloads on a new socket
+  const first = await a2.next(), second = await a2.next();
+  assert.deepEqual([first.t, first.phase, first.you], ['room', 'lobby', 0]);
+  assert.deepEqual(second, { t: 'end', winner: 0, reason: 'forfeit', forfeit: true }, 'the win she never saw');
+  // owed once: a further rejoin does not repeat it
+  await a2.terminate();
+  const a3 = await rejoin(s, code, roomA.token);
+  await a3.next('room');
+  await a3.flush();
+  assert.deepEqual(a3.pending().filter(m => m.t !== 'pong'), [], 'the debt was cleared when it was sent');
+  a.ws.terminate();
+});
+
+test('a forfeit winner who is connected gets the end live, and it is cleared when she readies up', async t => {
+  const s = await server(t, { graceMs: 3000 });
+  const { a, b, code, roomA } = await pair(s);
+  await readyBoth(a, b, 'start');
+  b.send({ t: 'leave' });
+  await b.next('left');
+  assert.deepEqual(await a.next('end'), { t: 'end', winner: 0, reason: 'forfeit', forfeit: true });
+  assert.equal((await a.next('room')).phase, 'lobby');
+  a.send({ t: 'ready' });                         // she has seen it: nothing is owed any more
+  await a.next(m => m.t === 'room' && m.players[0].ready);
+  await a.terminate();
+  const a2 = await rejoin(s, code, roomA.token);
+  await a2.next('room');
+  await a2.flush();
+  assert.deepEqual(a2.pending().filter(m => m.t !== 'pong'), []);
+});

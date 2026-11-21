@@ -12,3 +12,8 @@ services:
       # line in the logs: each player must show up as their own address (README, Deploy).
       - key: TRUST_PROXY_HOPS
         value: "1"
+      # Websocket handshakes from a browser must come from the game's own address. The server compares the
+      # Origin header with the Host it receives; naming the public address here keeps that working even if
+      # the platform rewrites Host. Add a custom domain here too (comma-separated) if you attach one.
+      - key: ALLOWED_ORIGINS
+        value: "https://legio-online.onrender.com"

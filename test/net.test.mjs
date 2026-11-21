@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHttpHandler } from '../lib/http.js';
-import { createTokenBucket, clientIp, createIpCounter, createFailureThrottle, proxyHops } from '../lib/limits.js';
+import { createTokenBucket, createKeyedBuckets, clientIp, createIpCounter, createFailureThrottle, proxyHops } from '../lib/limits.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SECRET = 'TOP-SECRET-FIXTURE';
@@ -386,6 +386,197 @@ test('/healthz does not need the disk or a working stats callback', async () => 
   }
 });
 
+// ---------- static files from memory ----------
+
+// A throwaway handler server over its own fixture directory, so that files can change under it.
+async function withHandler(options, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legio-net-cache-'));
+  write(path.join(dir, 'index.html'), INDEX);
+  write(path.join(dir, 'a.js'), 'one');
+  write(path.join(dir, 'sub', 'b.txt'), 'bee');
+  write(path.join(dir, '.dot'), SECRET);
+  const srv = http.createServer(createHttpHandler({ publicDir: dir, ...options }));
+  await new Promise(resolve => srv.listen(0, '127.0.0.1', resolve));
+  try { return await fn(srv.address().port, dir); } finally {
+    srv.closeAllConnections();
+    await new Promise(resolve => srv.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+// A request with extra header lines (each ending in CRLF); the same parser as the other tests.
+const getWith = async (target, headers, toPort, method = 'GET') => parseResponse(await rawExchange(toPort,
+  `${method} ${target} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n${headers}\r\n`));
+
+test('files are read once at start-up: later changes, new files and deleted files do not reach the disk', async () => {
+  await withHandler({}, async (p, dir) => {
+    const first = await getWith('/a.js', '', p);
+    assert.equal(first.body, 'one');
+    write(path.join(dir, 'a.js'), 'two');
+    write(path.join(dir, 'late.js'), 'late');
+    fs.rmSync(path.join(dir, 'sub', 'b.txt'));
+    assert.equal((await getWith('/a.js', '', p)).body, 'one', 'the copy in memory');
+    assert.equal((await getWith('/late.js', '', p)).status, 404, 'unknown: a miss in the table, no file system call');
+    assert.equal((await getWith('/sub/b.txt', '', p)).body, 'bee');
+    assert.equal((await getWith('/.dot', '', p)).status, 404);
+  });
+  await withHandler({ cacheStatic: false }, async (p, dir) => {
+    assert.equal((await getWith('/a.js', '', p)).body, 'one');
+    write(path.join(dir, 'a.js'), 'two');
+    write(path.join(dir, 'late.js'), 'late');
+    assert.equal((await getWith('/a.js', '', p)).body, 'two', 'every request reads the disk');
+    assert.equal((await getWith('/late.js', '', p)).body, 'late');
+    assert.equal((await getWith('/.dot', '', p)).status, 404, 'the path rules are the same without the cache');
+  });
+});
+
+test('a strong ETag per file; If-None-Match answers 304 with the headers and no body, HEAD included', async () => {
+  const one = await get('/client.js'), two = await get('/style.css');
+  assert.match(one.headers.etag, /^"[A-Za-z0-9_-]{20,}"$/);
+  assert.notEqual(one.headers.etag, two.headers.etag);
+  assert.equal((await get('/client.js')).headers.etag, one.headers.etag, 'stable');
+  const hit = await getWith('/client.js', `If-None-Match: ${one.headers.etag}\r\n`, port);
+  assert.equal(hit.status, 304);
+  assert.equal(hit.body, '');
+  assert.equal(hit.headers.etag, one.headers.etag);
+  assert.equal(hit.headers['cache-control'], 'no-cache');
+  assert.equal(hit.headers['x-content-type-options'], 'nosniff');
+  const html = await get('/');
+  const htmlHit = await getWith('/', `If-None-Match: "x", W/${html.headers.etag}\r\n`, port);
+  assert.equal(htmlHit.status, 304);
+  assert.equal(htmlHit.headers['content-security-policy'], CSP, 'the CSP is part of the 304 for HTML');
+  assert.equal((await getWith('/', 'If-None-Match: *\r\n', port)).status, 304);
+  assert.equal((await getWith('/', 'If-None-Match: "nope"\r\n', port)).status, 200);
+  assert.equal((await getWith('/client.js', `If-None-Match: ${two.headers.etag}\r\n`, port)).status, 200, 'the tag of another file');
+  assert.equal((await getWith('/client.js', `If-None-Match: ${one.headers.etag}\r\n`, port, 'HEAD')).status, 304);
+  const head = await getWith('/client.js', '', port, 'HEAD');
+  assert.equal([head.status, head.body, head.headers.etag === one.headers.etag].join(), '200,,true');
+  // an unknown path never gets a 304, whatever the validator
+  assert.equal((await getWith('/nope.js', 'If-None-Match: *\r\n', port)).status, 404);
+  // different content, different tag
+  await withHandler({}, async p => {
+    assert.notEqual((await getWith('/a.js', '', p)).headers.etag, (await getWith('/index.html', '', p)).headers.etag);
+  });
+});
+
+// ---------- per-address request limit ----------
+
+test('request limit: a burst per address is answered 429 with Retry-After; /healthz and other addresses are not limited', async () => {
+  await withHandler({ rate: { capacity: 5, refillPerSec: 0 }, trustProxy: 1 }, async p => {
+    const xff = ip => `X-Forwarded-For: ${ip}\r\n`;
+    const statuses = [];
+    for (let i = 0; i < 8; i++) statuses.push((await getWith('/a.js', xff('198.51.100.9'), p)).status);
+    assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429, 429, 429]);
+    const limited = await getWith('/a.js', xff('198.51.100.9'), p);
+    assert.equal(limited.headers['retry-after'], '1');
+    assert.equal(limited.headers['content-type'], 'text/plain; charset=utf-8');
+    assert.match(limited.body, /Too many requests/);
+    assertSecurityHeaders(limited, '429');
+    for (const method of ['GET', 'HEAD']) {
+      for (let i = 0; i < 8; i++) assert.equal((await getWith('/healthz', xff('198.51.100.9'), p, method)).status, 200, 'healthz is exempt');
+    }
+    assert.equal((await getWith('/healthz?stats', xff('198.51.100.9'), p)).status, 200);
+    // everything else counts: unknown paths, bad targets
+    assert.equal((await getWith('/nope', xff('198.51.100.9'), p)).status, 429);
+    assert.equal((await getWith('/%zz', xff('198.51.100.9'), p)).status, 429);
+    // another client address has its own bucket (the last X-Forwarded-For entry, one trusted hop)
+    for (let i = 0; i < 5; i++) assert.equal((await getWith('/a.js', xff('forged, 203.0.113.7'), p)).status, 200);
+    assert.equal((await getWith('/a.js', xff('forged, 203.0.113.7'), p)).status, 429);
+    assert.equal((await getWith('/a.js', xff('203.0.113.8'), p)).status, 200);
+  });
+  // without trustProxy the header is not believed: one bucket for the socket address
+  await withHandler({ rate: { capacity: 3, refillPerSec: 0 } }, async p => {
+    const statuses = [];
+    for (const ip of ['1.1.1.1', '2.2.2.2', '3.3.3.3', '4.4.4.4']) statuses.push((await getWith('/a.js', `X-Forwarded-For: ${ip}\r\n`, p)).status);
+    assert.deepEqual(statuses, [200, 200, 200, 429]);
+  });
+  // no rate option: no limit
+  await withHandler({}, async p => {
+    for (let i = 0; i < 60; i++) assert.equal((await getWith('/a.js', '', p)).status, 200);
+  });
+});
+
+test('keyed buckets: independent keys, refill by the clock, bounded table, the busiest offender is kept', () => {
+  let t = 1_000_000;
+  const b = createKeyedBuckets(3, 2, 10000, () => t);
+  for (let i = 0; i < 3; i++) assert.equal(b.take('a'), true);
+  assert.equal(b.take('a'), false);
+  assert.equal(b.take('b'), true, 'another key');
+  t += 500;                                     // one token
+  assert.equal(b.take('a'), true);
+  assert.equal(b.take('a'), false);
+  t += 60_000;                                  // full again, and no more than full
+  for (let i = 0; i < 3; i++) assert.equal(b.take('a'), true);
+  assert.equal(b.take('a'), false);
+
+  // bounded: thousands of distinct keys are never more than maxKeys
+  const small = createKeyedBuckets(2, 1, 100, () => t);
+  for (let i = 0; i < 5000; i++) small.take('k' + i);
+  assert.ok(small.size() <= 100, `${small.size()} keys`);
+  // an offender that keeps trying is the most recently used key: flooding with other keys does not free it
+  const guard = createKeyedBuckets(1, 0.001, 100, () => t);
+  assert.equal(guard.take('offender'), true);
+  for (let i = 0; i < 90; i++) { guard.take('other' + i); assert.equal(guard.take('offender'), false); }
+  // idle buckets (full again) are dropped from the front when the table is full
+  const idle = createKeyedBuckets(2, 1, 50, () => t);
+  for (let i = 0; i < 50; i++) idle.take('old' + i);
+  t += 10_000;
+  idle.take('fresh');
+  assert.equal(idle.size(), 1, 'every idle bucket was dropped at once');
+  // bad configuration denies; odd arguments never throw
+  assert.equal(createKeyedBuckets(NaN, 1).take('x'), false);
+  assert.equal(createKeyedBuckets(-1, 1).take('x'), false);
+  assert.equal(createKeyedBuckets(2, 1, NaN).take('x'), true);
+  for (const key of ['__proto__', 'constructor', '', undefined, 42]) assert.equal(createKeyedBuckets(1, 0).take(key), true, String(key));
+});
+
+// ---------- failure throttle: forgive, amortised pruning ----------
+
+test('failure throttle: forgive wipes one key only', () => {
+  const throttle = createFailureThrottle(2, 60000, () => 5000);
+  throttle.fail('a'); throttle.fail('a'); throttle.fail('b'); throttle.fail('b');
+  assert.equal(throttle.blocked('a'), true);
+  throttle.forgive('a');
+  assert.equal(throttle.blocked('a'), false);
+  assert.equal(throttle.blocked('b'), true);
+  throttle.forgive('never seen');
+  throttle.fail('a');
+  assert.equal(throttle.blocked('a'), false, 'counting starts again from zero');
+});
+
+test('failure throttle: a failure from a new key on a full table does not rescan the table (regression: 10000 clock reads each)', () => {
+  let t = 0, reads = 0;
+  const throttle = createFailureThrottle(3, 60000, () => { reads++; return t; });
+  for (let i = 0; i < 10000; i++) { t += 1; throttle.fail('fill' + i); }
+  assert.equal(throttle.size(), 10000);
+  reads = 0;
+  for (let i = 0; i < 500; i++) { t += 1; throttle.fail('new' + i); }
+  assert.equal(throttle.size(), 10000, 'still bounded');
+  assert.ok(reads / 500 < 40, `${reads / 500} clock reads per failure`);
+});
+
+test('failure throttle: expired keys are dropped as the table fills, and flooding with new keys does not free a blocked one', () => {
+  let t = 0;
+  const throttle = createFailureThrottle(3, 1000, () => t);
+  for (let i = 0; i < 3; i++) { throttle.fail('victim'); t += 1; }
+  assert.equal(throttle.blocked('victim'), true);
+  // 20000 other addresses fail once each, inside the same window: the table is full the whole time
+  for (let i = 0; i < 20000; i++) throttle.fail('flood' + i);
+  assert.equal(throttle.blocked('victim'), true, 'a blocked key is not the one that is shed');
+  assert.ok(throttle.size() <= 10000);
+  // the window passes: everything is expired; new failures push the expired keys out from the front
+  t += 5000;
+  for (let i = 0; i < 20; i++) throttle.fail('later' + i);
+  assert.equal(throttle.size(), 20, 'expired keys were dropped from the front, in one pass');
+  assert.equal(throttle.blocked('victim'), false);
+  // a key that keeps failing moves to the back: it outlives keys that failed before it
+  const t2 = createFailureThrottle(2, 1000, () => t);
+  t2.fail('old'); t += 600; t2.fail('keeper'); t += 600; t2.fail('keeper');
+  assert.equal(t2.blocked('keeper'), true);
+  t2.fail('newcomer');
+  assert.equal(t2.blocked('old'), false);
+  assert.equal(t2.blocked('keeper'), true);
+});
+
 // ---------- robots.txt (the real one) ----------
 
 test('public/robots.txt keeps crawlers out', () => {
@@ -465,7 +656,7 @@ test('token bucket: odd clocks and odd arguments are safe', () => {
 
 const fakeReq = (remoteAddress, xff, extra = {}) => ({ socket: { remoteAddress }, headers: { ...(xff === undefined ? {} : { 'x-forwarded-for': xff }), ...extra } });
 
-test('clientIp: socket address unless the proxy is trusted; IPv6 is keyed by its /64', () => {
+test('clientIp: socket address unless the proxy is trusted; IPv6 is keyed by its /56', () => {
   assert.equal(clientIp(fakeReq('203.0.113.9', '198.51.100.7'), false), '203.0.113.9');
   assert.equal(clientIp(fakeReq('203.0.113.9', '198.51.100.7'), undefined), '203.0.113.9');
   assert.equal(clientIp(fakeReq('203.0.113.9', '198.51.100.7'), 0), '203.0.113.9');
@@ -475,18 +666,25 @@ test('clientIp: socket address unless the proxy is trusted; IPv6 is keyed by its
   assert.equal(clientIp(fakeReq('::1'), false), '0:0:0:0');
 });
 
-test('clientIp: one key per IPv6 /64, whatever the spelling; another /64 is another client', () => {
-  const same = ['2001:db8:1:1::a', '2001:db8:1:1::b', '2001:db8:1:1:0:0:0:a', '2001:0db8:1:1::A', '2001:DB8:1:1:ffff:ffff:ffff:ffff',
-    '[2001:db8:1:1::a]:443', '2001:db8:1:1::a%eth0', '2001:db8:1:1:0:0:1.2.3.4'];
-  for (const addr of same) assert.equal(clientIp(fakeReq(addr), false), '2001:db8:1:1', addr);
-  assert.equal(clientIp(fakeReq('2001:db8:1:2::a'), false), '2001:db8:1:2');
-  assert.notEqual(clientIp(fakeReq('2001:db8:1:2::a'), false), clientIp(fakeReq('2001:db8:1:1::a'), false));
+test('clientIp: one key per IPv6 /56, whatever the spelling; another /56 is another client', () => {
+  // all of 2001:db8:1:0000-00ff::/64 are one /56 ('2001:db8:1:0'); 2001:db8:1:100::/56 is the next one
+  const same = ['2001:db8:1:1::a', '2001:db8:1:2::b', '2001:db8:1:ff::1', '2001:db8:1::1', '2001:db8:1:0:0:0:0:a', '2001:0db8:1:1::A',
+    '2001:DB8:1:ff:ffff:ffff:ffff:ffff', '[2001:db8:1:1::a]:443', '2001:db8:1:1::a%eth0', '2001:db8:1:1:0:0:1.2.3.4'];
+  for (const addr of same) assert.equal(clientIp(fakeReq(addr), false), '2001:db8:1:0', addr);
+  for (const addr of ['2001:db8:1:100::a', '2001:db8:1:1ff::a', '2001:db8:1:ffff::1']) {
+    assert.notEqual(clientIp(fakeReq(addr), false), '2001:db8:1:0', addr);
+  }
+  assert.equal(clientIp(fakeReq('2001:db8:1:100::a'), false), '2001:db8:1:100');
+  assert.equal(clientIp(fakeReq('2001:db8:1:1ff::a'), false), '2001:db8:1:100');
+  assert.equal(clientIp(fakeReq('2001:db8:1:ffff::1'), false), '2001:db8:1:ff00');
+  assert.equal(clientIp(fakeReq('2001:db8:2:1::a'), false), '2001:db8:2:0');
+  assert.notEqual(clientIp(fakeReq('2001:db8:2:1::a'), false), clientIp(fakeReq('2001:db8:1:1::a'), false));
   // behind a proxy the same rule applies to the forwarded address
-  assert.equal(clientIp(fakeReq('10.0.0.1', '2001:db8:1:1::a, 2001:db8:5:5::1'), 2), '2001:db8:1:1');
-  assert.equal(clientIp(fakeReq('10.0.0.1', '2001:db8:1:1::b'), true), '2001:db8:1:1');
+  assert.equal(clientIp(fakeReq('10.0.0.1', '2001:db8:1:1::a, 2001:db8:5:5::1'), 2), '2001:db8:1:0');
+  assert.equal(clientIp(fakeReq('10.0.0.1', '2001:db8:1:1::b'), true), '2001:db8:1:0');
   assert.equal(clientIp(fakeReq('::ffff:1.2.3.4'), false), '1.2.3.4');
   assert.equal(clientIp(fakeReq('::'), false), '0:0:0:0');
-  assert.equal(clientIp(fakeReq('1:2:3:4:5:6:7:8'), false), '1:2:3:4');
+  assert.equal(clientIp(fakeReq('1:2:3:4:5:6:7:8'), false), '1:2:3:0');
 });
 
 test('clientIp: true is one trusted proxy: the last X-Forwarded-For entry, never the first', () => {

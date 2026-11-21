@@ -11,10 +11,13 @@ export const test = (name, fn) => nodeTest(name, { timeout: 60000 }, fn);
 
 // Timers are tiny, and several sim steps run per timer tick, because OS timers
 // can be as coarse as ~15 ms (Windows): a 300 s battle must not take minutes.
-// The message budget is wide open: test clients order far faster than people do.
+// The message budget is wide open: test clients order far faster than people do. So are the per-address
+// limits on HTTP requests and WebSocket upgrades (every test client connects from 127.0.0.1); the tests of
+// those limits pass httpRate / upgradeRate: undefined to get the real defaults.
+const OPEN = { capacity: 1e6, refillPerSec: 1e6 };
 export const FAST = {
   tickMs: 2, stepsPerTick: 10, betweenMs: 20, resolveDelayMs: 10, graceMs: 400, resumeDelayMs: 20,
-  hurryMs: 60000, heartbeatMs: 60000, rate: { capacity: 1e6, refillPerSec: 1e6 }, log: () => {},
+  hurryMs: 60000, heartbeatMs: 60000, rate: OPEN, httpRate: OPEN, upgradeRate: OPEN, log: () => {},
 };
 
 export async function startTestServer(options = {}) {

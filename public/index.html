@@ -24,7 +24,7 @@
   #banner{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:40;max-width:92vw;padding:8px 14px;background:#14110cf2;border:1px solid #d9b45a;border-radius:4px;color:#f1dfae;font-size:15px;text-align:center}
   #banner button{margin:0 0 0 10px;padding:3px 10px;font-size:13px}
   #game{display:none;position:fixed;inset:0;user-select:none;-webkit-user-select:none}
-  canvas{display:block;width:100vw;height:100vh;background:#4d5b2f;cursor:crosshair}
+  canvas{display:block;width:100vw;height:100vh;background:#4d5b2f;cursor:crosshair;touch-action:none}
   #hud{position:fixed;top:8px;left:8px;background:#000a;padding:8px 12px;border-radius:4px;font-size:14px;pointer-events:none;white-space:nowrap}
   #hud .sep{margin:0 8px;color:#8b7c60}
   #hudClock{font-variant-numeric:tabular-nums}
@@ -32,12 +32,31 @@
   #btnQuit{display:none;position:fixed;top:8px;right:48px;z-index:25}
   #btnQuit.onMap{right:auto;left:8px}
   #cards{position:fixed;left:0;right:0;bottom:6px;display:flex;flex-wrap:wrap;justify-content:center;gap:4px;padding:0 8px;pointer-events:none}
-  .card{pointer-events:auto;width:96px;padding:3px 6px 4px;background:#14110ce6;border:1px solid #5d4a22;border-radius:4px;font-size:11px;line-height:1.3;text-align:left;cursor:pointer}
+  .card{touch-action:manipulation;pointer-events:auto;width:96px;padding:3px 6px 4px;background:#14110ce6;border:1px solid #5d4a22;border-radius:4px;font-size:11px;line-height:1.3;text-align:left;cursor:pointer}
   .card.sel{border-color:#7dff7d;box-shadow:0 0 0 1px #7dff7d}
   .card.out{opacity:.4;filter:grayscale(1);cursor:default}
   .card .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#d9b45a}
   .card .mb{height:4px;margin-top:2px;background:#000a}
   .card .mb i{display:block;height:100%;width:100%;background:#6dd36d}
+  #quitAsk{display:none;position:fixed;left:50%;top:64px;transform:translateX(-50%);z-index:45;max-width:92vw;padding:12px 16px;background:#14110cf7;border:1px solid #d9b45a;border-radius:4px;text-align:center}
+  #quitAsk div{margin-bottom:6px}
+  #touchNote{display:none;font-size:13px;color:#c9b78f;margin-top:14px}
+  button{touch-action:manipulation}
+  @media (pointer:coarse){
+    button{min-height:44px}
+    button.mini{min-width:44px;padding-top:8px;padding-bottom:8px}
+    #btnQuit{right:60px}
+    .card{min-height:44px}
+  }
+  @media (any-pointer:coarse) and (not (any-pointer:fine)){
+    #touchNote{display:block}
+    #mouseNote{display:none}
+  }
+  @media (max-width:600px){
+    #hud{white-space:normal;max-width:calc(100vw - 140px);font-size:12px;line-height:1.3;padding:4px 8px}
+    #hud .sep{display:none}
+    #hud span:not(.sep){display:inline-block;margin-right:10px}
+  }
   #end{z-index:20;display:none;position:fixed;inset:0;background:#000b;align-items:center;justify-content:center;flex-direction:column;font-size:36px;text-align:center}
   #endSub{font-size:18px;color:#c9b78f;margin:6px 0 14px;min-height:1.2em}
   #help{display:none;position:fixed;inset:0;z-index:30;background:#000b;align-items:center;justify-content:center}
@@ -81,7 +100,8 @@
     <button id="btnLeave" type="button" class="quiet">Leave room</button>
   </div>
   <div id="err"></div>
-  <p style="font-size:12px;color:#8b7c60;margin-top:18px">Battles - left-click / drag: select &middot; Right-click ground: move &middot; Right-click enemy: attack &middot; Right-drag: form a line &middot; S: stop</p>
+  <p id="touchNote">On a phone: tap a regiment or its card, then tap where it should go; tap an enemy to attack.</p>
+  <p id="mouseNote" style="font-size:12px;color:#8b7c60;margin-top:18px">Battles - left-click / drag: select &middot; Right-click ground: move &middot; Right-click enemy: attack &middot; Right-drag: form a line &middot; S: stop</p>
   <button id="btnHowTo" type="button" class="quiet mini">How to play</button>
 </div>
 <div id="camp"><svg id="map" viewBox="0 0 1000 600" preserveAspectRatio="xMidYMid meet"></svg><div id="panel"></div></div>
@@ -92,6 +112,7 @@
   <div id="cards"></div>
 </div>
 <button id="btnQuit" type="button" class="quiet mini" title="Leave this game (you forfeit)">Quit</button>
+<div id="quitAsk" role="alertdialog" aria-label="Quit this game"><div>Quit this game? You will forfeit.</div><button id="btnQuitYes" type="button">Yes, quit</button><button id="btnQuitNo" type="button" class="quiet">Keep playing</button></div>
 <div id="end"><div id="endText"></div><div id="endSub"></div><button id="btnAgain" type="button" style="font-size:20px">Return to lobby</button></div>
 <div id="help"><div class="box">
   <h2>HOW TO FIGHT</h2>
@@ -103,6 +124,7 @@
     <li><kbd>A</kbd> select all &middot; <kbd>1</kbd> swords &middot; <kbd>2</kbd> spears &middot; <kbd>3</kbd> archers &middot; <kbd>4</kbd> cavalry</li>
     <li><kbd>S</kbd> stop &middot; <kbd>Esc</kbd> deselect &middot; <kbd>H</kbd> or <kbd>?</kbd> this help</li>
     <li>Unit cards along the bottom: click selects, Shift-click adds, double-click selects every regiment of that type.</li>
+    <li><b>Touch screen</b>: tap a regiment or its card to select or deselect it (double-tap a card for every regiment of that type); tap the ground to march the selection there; tap an enemy to attack it.</li>
   </ul>
   <h3>Match-ups</h3>
   <ul>
@@ -112,7 +134,7 @@
     <li><b>Rear attacks</b> break morale: a regiment whose morale bar empties routs (white flag) and takes no more orders.</li>
   </ul>
   <h3>Time limit</h3>
-  <p style="margin:0 0 12px">A battle ends when one army breaks or when the clock runs out. At the time limit the army with more men left wins; in a campaign the defender gets a 25% edge.</p>
+  <p style="margin:0 0 12px">A battle ends when one army breaks or when the clock runs out. If time runs out, the army that kept more of its starting strength wins; the defender only needs three quarters of the attacker's share. A campaign also ends after a set number of turns (shown in its side panel): the player with more provinces wins.</p>
   <div style="text-align:center"><button id="btnHelpClose" type="button">Close</button></div>
 </div></div>
 <script src="client.js"></script>

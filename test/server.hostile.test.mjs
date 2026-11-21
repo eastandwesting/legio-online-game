@@ -275,6 +275,9 @@ test('a fault in a campaign timer ends the campaign as a draw instead of leaving
   assert.equal(overA.winner, -1);
   assert.equal(overA.phase, 'over');
   assert.equal(overB.winner, -1);
+  assert.equal(overA.endReason, 'fault', 'a fault is its own end reason');
+  assert.equal(overB.endReason, 'fault');
+  assert.equal(overA.turnLimit, 100);
   assert.equal((await a.next('room')).phase, 'over');
   assert.equal(s.logs.length, 1);
   // a new campaign can be started in the same room

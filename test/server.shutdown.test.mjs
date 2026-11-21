@@ -57,7 +57,7 @@ test('after close() nothing keeps the event loop alive (the process ends by itse
   // Production-length timers everywhere: if close() left any of them running, the child would hang.
   const script = `
     import { startTestServer, connect, pair, readyBoth } from ${url('test/harness.mjs')};
-    const s = await startTestServer({ betweenMs: 3500, resolveDelayMs: 1200, graceMs: 60000, resumeDelayMs: 1500,
+    const s = await startTestServer({ maxRoomsPerIp: 20, betweenMs: 3500, resolveDelayMs: 1200, graceMs: 60000, resumeDelayMs: 1500,
       hurryMs: 90000, heartbeatMs: 25000, idleRoomMs: 2700000, tickMs: 50, stepsPerTick: 1 });
     const battle = await pair(s);
     await readyBoth(battle.a, battle.b, 'start');                       // a running battle
@@ -213,13 +213,15 @@ test('run directly: an uncaught exception and an unhandled rejection are logged 
 });
 
 test('run directly: TRUST_PROXY_HOPS counts proxies from the right (1 on Render, off elsewhere); MAX_PER_IP is the limit', async () => {
-  // 41 connections, each claiming another client address in front of two shared proxy-added entries.
-  // The number accepted shows which entry was believed: the same address for all (limit applies), or a different one each.
+  // 8 connections (fewer than the 10 WebSocket upgrades per address the server lets through at once), each
+  // claiming another client address in front of two shared proxy-added entries. MAX_PER_IP is 4 in every
+  // scenario. The number accepted shows which entry was believed: the same address for all (limit applies),
+  // or a different one each. (The default limits of 20 and 40 are checked in server.hostile.test.mjs.)
   const body = `
     await c.close();
     await wait(100);
     const all = [];
-    for (let i = 1; i <= 41; i++) all.push(await connect(wsUrl, { headers: { 'X-Forwarded-For': '192.0.2.' + i + ', 203.0.113.' + i + ', 198.51.100.7' } }));
+    for (let i = 1; i <= 8; i++) all.push(await connect(wsUrl, { headers: { 'X-Forwarded-For': '192.0.2.' + i + ', 203.0.113.' + i + ', 198.51.100.7' } }));
     let accepted = 0;
     for (const x of all) {
       try { x.send({ t: 'ping' }); } catch { /* already closed */ }
@@ -232,13 +234,14 @@ test('run directly: TRUST_PROXY_HOPS counts proxies from the right (1 on Render,
     assert.equal(run.code, 0, `${JSON.stringify(env)} stderr: ${run.stderr}`);
     return Number((/accepted (\d+)/.exec(run.stdout) || [])[1]);
   };
-  assert.equal(await accepted({}), 20, 'not behind a proxy: the header is ignored, all share the socket address (20 per address)');
-  assert.equal(await accepted({ RENDER: 'true' }), 40, 'on Render: one trusted hop, the last entry is shared (40 per address behind a proxy)');
-  assert.equal(await accepted({ RENDER: 'true', TRUST_PROXY_HOPS: '0' }), 20, 'switched off');
-  assert.equal(await accepted({ TRUST_PROXY_HOPS: '1' }), 40, 'one proxy of our own: the last entry, which a client cannot forge');
-  assert.equal(await accepted({ TRUST_PROXY_HOPS: '2' }), 41, 'two proxies: the entry before the last tells the clients apart');
+  const four = { MAX_PER_IP: '4' };
+  assert.equal(await accepted({ ...four }), 4, 'not behind a proxy: the header is ignored, all share the socket address');
+  assert.equal(await accepted({ ...four, RENDER: 'true' }), 4, 'on Render: one trusted hop, the last entry is shared');
+  assert.equal(await accepted({ ...four, RENDER: 'true', TRUST_PROXY_HOPS: '0' }), 4, 'switched off');
+  assert.equal(await accepted({ ...four, TRUST_PROXY_HOPS: '1' }), 4, 'one proxy of our own: the last entry, which a client cannot forge');
+  assert.equal(await accepted({ ...four, TRUST_PROXY_HOPS: '2' }), 8, 'two proxies: the entry before the last tells the clients apart');
   assert.equal(await accepted({ TRUST_PROXY_HOPS: '1', MAX_PER_IP: '7' }), 7, 'MAX_PER_IP');
-  assert.equal(await accepted({ TRUST_PROXY_HOPS: 'banana', MAX_PER_IP: '-4' }), 20, 'invalid values are ignored');
+  assert.equal(await accepted({ TRUST_PROXY_HOPS: 'banana', MAX_PER_IP: '-4' }), 8, 'invalid values are ignored (the default allows all 8)');
 });
 
 test('run directly: if close() never finishes, the hard 3 s deadline still ends the process (exit 0)', async () => {

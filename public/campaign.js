@@ -6,6 +6,7 @@
   'use strict';
 
   const QUIT_GUARD_MS = 400;
+  const END_REASONS = ['capital', 'both_capitals', 'turn_limit', 'fault', 'forfeit'];
   const SIDE = [['#b3262a', 'Red'], ['#2a4f9b', 'Blue']];
   const NEUTRAL = '#6e6a5c';
   const FALLBACK_NAME = { sword: 'Shortsword Infantry', spear: 'Spear Phalanx', archer: 'Archers', cav: 'Heavy Cavalry' };
@@ -29,6 +30,7 @@
   let timer = null;        // the one countdown interval
   let deadlineEnd = 0;     // local clock (ms) at which the hurry-up deadline runs out
   let frozenMs = null;     // time left (ms) while the opponent is disconnected: the server stops its timer then
+  let lastDl = null;       // {turn, who, frozen}: the hurry-up countdown of this turn, kept while the server pauses it
   const drawn = { map: null, panel: null };   // HTML last written, to skip no-op redraws
   const bound = { map: null, panel: null };   // elements that already carry our click listener
 
@@ -79,6 +81,8 @@
       ready: [!!ready[0], !!ready[1]],
       log: arr(m.log).filter(l => typeof l === 'string').slice(-8),
       opponent: str(m.opponent),
+      turnLimit: Number.isInteger(m.turnLimit) && m.turnLimit > 0 && m.turnLimit <= 100000 ? m.turnLimit : null,
+      endReason: END_REASONS.includes(m.endReason) ? m.endReason : null,
       deadline: phase === 'orders' && winner === null ? cleanDeadline(m.deadline) : null,
     };
   }
@@ -107,7 +111,19 @@
 
   function cleanDeadline(d) {
     if (!isObj(d) || !isSeat(d.who) || !Number.isFinite(d.left)) return null;
-    return { who: d.who, left: Math.max(0, d.left) };
+    return { who: d.who, left: Math.max(0, d.left), paused: false };
+  }
+
+  // While the room is paused (a player is away) the server sends the camp view with deadline: null, so
+  // the countdown would vanish. Within the same turn, a missing deadline after a known one is that pause:
+  // keep the last time left, frozen, and mark it paused. It runs again when the server sends a deadline.
+  function carryDeadline(v) {
+    const live = v.phase === 'orders' && v.winner === null;
+    if (!live) { lastDl = null; return; }
+    if (v.deadline) { lastDl = { turn: v.turn, who: v.deadline.who, frozen: null }; return; }
+    if (!lastDl || lastDl.turn !== v.turn) { lastDl = null; return; }
+    if (lastDl.frozen === null) lastDl.frozen = Math.max(0, frozenMs !== null ? frozenMs : deadlineEnd - Date.now()) / 1000;   // stands still from now on
+    v.deadline = { who: lastDl.who, left: lastDl.frozen, paused: true };
   }
 
   // ---------- queries on a view ----------
@@ -177,7 +193,8 @@
     const cap = Number.isFinite(v.maxUnits) ? `/${v.maxUnits}` : '';
     const income = v.income === null ? '' : ` &middot; Income: +${v.income * owned}/turn`;
     const foe = v.opponent ? ` vs ${esc(v.opponent)}` : '';
-    return `<h2>Turn ${v.turn}</h2>` +
+    const turn = v.turnLimit === null ? `Turn ${v.turn}` : `Turn ${v.turn} of ${v.turnLimit}`;
+    return `<h2>${turn}</h2>` +
       `<div>You command <b style="color:${SIDE[me][0]}">${SIDE[me][1]}</b>${foe}</div>` +
       `<div>Gold: <b>${v.gold}</b> &middot; Units: ${v.units}${cap}${income}</div>`;
   }
@@ -231,7 +248,7 @@
   function statusHtml(v) {
     if (v.winner !== null) {
       const text = v.winner === -1 ? 'The campaign ends in a draw.' : v.winner === v.you ? 'Campaign won!' : 'Campaign lost.';
-      return `<div><b>${text}</b></div>`;
+      return `<div><b>${text}</b></div><div class="camp-muted">${esc(endReasonText(v))}</div>`;
     }
     if (v.phase === 'battle') return '<div>A battle is being fought&hellip;</div>';
     if (v.phase !== 'orders') return '<div>Armies are on the march&hellip;</div>';
@@ -248,9 +265,11 @@
     return '<div class="camp-rules"><b>Rules</b><ul>' +
       `<li>Units regain ${pct}% strength per turn in friendly provinces.</li>` +
       '<li>Survivors regroup after a battle.</li>' +
-      '<li>The province owner defends. If a battle runs out of time, the army with more men left wins, and the defender gets a 25% edge.</li>' +
+      "<li>The province owner defends. If time runs out, the army that kept more of its starting strength wins; the defender only needs three quarters of the attacker's share.</li>" +
       '<li>Armies that cross paths turn back.</li>' +
-      '<li>Take the enemy capital to win.</li></ul></div>';
+      '<li>Take the enemy capital to win.</li>' +
+      (v.turnLimit === null ? '' : `<li>The campaign ends after turn ${v.turnLimit}: the player with more provinces wins.</li>`) +
+      '</ul></div>';
   }
 
   function quitHtml(v) {
@@ -307,7 +326,7 @@
   function syncDeadline() {
     if (!view || !view.deadline) return stopTimer();
     deadlineEnd = Date.now() + view.deadline.left * 1000;
-    frozenMs = null;
+    frozenMs = view.deadline.paused ? view.deadline.left * 1000 : null;
     if (timer === null) timer = setInterval(paintDeadline, 250);
   }
 
@@ -320,7 +339,7 @@
   function paintDeadline() {
     if (!view || !view.deadline) return stopTimer();
     const now = Date.now();
-    if (opponentAway()) {
+    if (view.deadline.paused || opponentAway()) {
       if (frozenMs === null) frozenMs = Math.max(0, deadlineEnd - now);
     } else if (frozenMs !== null) {
       deadlineEnd = now + frozenMs;   // resume from where it stood
@@ -399,17 +418,29 @@
   }
 
   // ---------- end of campaign ----------
-  function announceEnd(v) {
+  // Why the campaign ended: the server's endReason when it sends one, else a guess from the map.
+  function endReasonText(v) {
     const drawGame = v.winner === -1, won = v.winner === v.you;
-    const title = drawGame ? 'CAMPAIGN DRAW' : won ? 'CAMPAIGN VICTORY' : 'CAMPAIGN DEFEAT';
+    switch (v.endReason) {
+      case 'capital': return drawGame ? 'The campaign ended in a draw' : won ? 'The enemy capital has fallen' : 'Your capital has fallen';
+      case 'turn_limit': return drawGame ? 'Turn limit reached: equal provinces, a draw' : 'Turn limit reached: the player with more provinces wins';
+      case 'both_capitals': return 'Both capitals fell in the same turn';
+      case 'fault': return 'The game ended because of a server problem';
+      case 'forfeit': return 'Your opponent left';
+      default: break;
+    }
     // Winner -1 also comes from a server fault, so name a capital only when the map shows it fell.
     const known = v.capital.length === 2;
     const fell = side => known && v.owner[v.capital[side]] === 1 - side;   // side's capital is held by the other
-    let reason;
-    if (drawGame) reason = fell(0) && fell(1) ? 'Both capitals fell in the same turn' : 'The campaign ended in a draw';
-    else if (won) reason = fell(1 - v.you) ? 'The enemy capital has fallen' : 'The campaign was won';
-    else reason = fell(v.you) ? 'Your capital has fallen' : 'The campaign was lost';
-    const sub = `${reason} (turn ${v.turn}).`;
+    if (drawGame) return fell(0) && fell(1) ? 'Both capitals fell in the same turn' : 'The campaign ended in a draw';
+    if (won) return fell(1 - v.you) ? 'The enemy capital has fallen' : 'The campaign was won';
+    return fell(v.you) ? 'Your capital has fallen' : 'The campaign was lost';
+  }
+
+  function announceEnd(v) {
+    const drawGame = v.winner === -1, won = v.winner === v.you;
+    const title = drawGame ? 'CAMPAIGN DRAW' : won ? 'CAMPAIGN VICTORY' : 'CAMPAIGN DEFEAT';
+    const sub = `${endReasonText(v)} (turn ${v.turn}).`;
     if (typeof showEndOverlay === 'function') { showEndOverlay(title, sub, { leave: true }); return; }
     // no overlay helper (older client.js): drive the overlay elements directly
     const text = $('endText'), subEl = $('endSub'), btn = $('btnAgain'), box = $('end');
@@ -425,8 +456,9 @@
     const v = normalise(m);
     if (!v) return;
     const fresh = view && (v.turn < view.turn || (view.winner !== null && v.winner === null));
-    if (fresh) { sel = null; quitArmed = false; }   // a new campaign started in the same room
+    if (fresh) { sel = null; quitArmed = false; lastDl = null; }   // a new campaign started in the same room
     if (sel !== null && sel >= v.provs.length) sel = null;
+    carryDeadline(v);
     view = v;
     syncDeadline();
     draw();
@@ -439,6 +471,7 @@
     sel = null;
     quitArmed = false;
     quitArmedAt = 0;
+    lastDl = null;
     stopTimer();
     for (const key of ['map', 'panel']) {
       const el = $(key);

@@ -22,7 +22,11 @@ var LegioClient = (function () {
   const FULL_RETRY_MS = 10000;              // server full (close 1013): fixed, patient retry
   const FULL_TEXT = 'Server is full, retrying...';
   // live-battle link watchdog (see watchLink)
-  const WATCH_MS = 1000, WATCH_PING_MS = 2000, NO_SIGNAL_MS = 3500, DEAD_LINK_MS = 6000;
+  // 'no signal' shows after max(NO_SIGNAL_MIN_MS, NO_SIGNAL_RTTS x measured round trip) of silence
+  const WATCH_MS = 1000, WATCH_PING_MS = 2000, NO_SIGNAL_MIN_MS = 6000, NO_SIGNAL_RTTS = 4, DEAD_LINK_MS = 6000;
+  const MAX_PINGS = 8, MAX_RTT_MS = 60000;
+  const QUIT_GUARD_MS = 400;                // "Yes, quit" ignores clicks right after the question appeared
+  const TAP_MOVE_PX = 14, TAP_MAX_MS = 800, TAP_HIT_PX = 24, DOUBLE_TAP_MS = 400, MOUSE_AFTER_TOUCH_MS = 800;
   const REJOIN_WAIT_MS = 8000, LEAVE_WAIT_MS = 3000, SHUTDOWN_WAIT_MS = 5000;
   const HUD_SPACE = 52;                     // px kept free above the field for the HUD
   const HIT_RADIUS = 28, LINE_DRAG_MIN = 30, FIELD_MARGIN = 10;
@@ -81,9 +85,11 @@ var LegioClient = (function () {
   let helpOpen = false;
   let flashText = '', flashTimer = 0;
   let loopOn = false, drawFailed = false;
+  let quitAskAt = 0;          // when (ms) the in-page "Quit this game?" question opened; 0 = closed
 
   const conn = { ws: null, state: 'connecting', everOpen: false, attempt: 0, lostAt: 0, waking: false,
-    full: false, stale: false, prev: null, notice: '', lastRx: 0, pingAt: 0, watchPingAt: 0, retryTimer: 0, giveUpTimer: 0, attemptTimer: 0, noticeTimer: 0 };
+    full: false, stale: false, prev: null, notice: '', lastRx: 0, pingAt: 0, watchPingAt: 0, retryTimer: 0, giveUpTimer: 0, attemptTimer: 0, noticeTimer: 0,
+    pings: [], rtt: 0 };   // pings: send times of pings still unanswered; rtt: smoothed round trip (ms), 0 = unknown
   const peer = { lost: false, until: 0, timer: 0 };
   const battle = { live: false, W: 1600, H: 900, types: {}, limit: 0, time: 0, left: null,
     regs: [], byId: new Map(), prevById: new Map(), snapAt: 0, prevAt: 0, startMen: new Map(),
@@ -91,6 +97,8 @@ var LegioClient = (function () {
   const selected = new Set();
   const view = { scale: 1, ox: 0, oy: 0, dpr: 1 };
   const pointer = { x: 0, y: 0, box: null, line: null };
+  const touch = { id: null, x: 0, y: 0, at: 0, last: -1e9, tapType: '', tapAt: -1e9 };   // one finger on the field; last = latest touch (ms)
+  const cardPtr = { type: '', at: -1e9 };   // pointer type that went down on a unit card, for the click that follows
   const cardEls = new Map();  // regiment id -> {el, men, bar, key}
   let fx = [];                // short-lived order markers
 
@@ -125,6 +133,24 @@ var LegioClient = (function () {
     if (!ws || conn.state !== 'open' || ws.readyState !== 1) return false;
     try { ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
   }
+
+  // Every ping is timed: the server answers each one with a pong, in order, so the oldest unanswered
+  // send time belongs to the next pong. The smoothed round trip sets the 'no signal' threshold.
+  function sendPing() {
+    if (!send({ t: 'ping' })) return false;
+    conn.pings.push(Date.now());
+    if (conn.pings.length > MAX_PINGS) conn.pings.shift();
+    return true;
+  }
+  function onPong() {
+    const sent = conn.pings.shift();
+    if (!isNum(sent)) return;
+    const sample = clamp(Date.now() - sent, 0, MAX_RTT_MS);
+    conn.rtt = conn.rtt ? (conn.rtt + sample) / 2 : sample;
+  }
+  const noSignalMs = () => Math.max(NO_SIGNAL_MIN_MS, NO_SIGNAL_RTTS * conn.rtt);
+  // The link is given up one watchdog tick after 'no signal' shows, and never before DEAD_LINK_MS.
+  const deadLinkMs = () => Math.max(DEAD_LINK_MS, noSignalMs() + WATCH_MS);
 
   function connect() {
     clearTimeout(conn.retryTimer);
@@ -165,9 +191,9 @@ var LegioClient = (function () {
     conn.prev = { attempt: conn.attempt, lostAt: conn.lostAt };
     conn.state = 'open'; conn.everOpen = true; conn.attempt = 0; conn.lostAt = 0;
     conn.waking = false; conn.stale = false; conn.notice = '';
-    conn.lastRx = Date.now(); conn.pingAt = 0;
+    conn.lastRx = Date.now(); conn.pingAt = 0; conn.pings = [];
     clearTimeout(conn.giveUpTimer); clearTimeout(conn.attemptTimer);
-    send({ t: 'ping' });   // a page without a seat gets its first frame (the proof) right away
+    sendPing();   // a page without a seat gets its first frame (the proof) right away
     if (seat) startRejoin();
     else if (room || screen !== 'menu') localLeave('The connection was lost and the game could not be resumed.');
     renderBanner(); renderMenu();
@@ -235,7 +261,7 @@ var LegioClient = (function () {
     // nothing at all arrived since the previous ping (the server answers every ping): dead link
     if (conn.pingAt && conn.lastRx < conn.pingAt) return forceReconnect();
     conn.pingAt = Date.now();
-    send({ t: 'ping' });
+    sendPing();
   }
 
   // During a live battle snapshots arrive 20 times a second, so a silent socket is suspicious long before
@@ -244,10 +270,10 @@ var LegioClient = (function () {
   function watchLink() {
     if (conn.state !== 'open' || !battle.live || screen !== 'battle') return;
     const now = Date.now(), quiet = now - conn.lastRx;
-    if (quiet > DEAD_LINK_MS) return forceReconnect(true);
+    if (quiet > deadLinkMs()) return forceReconnect(true);
     if (quiet > WATCH_PING_MS && now - conn.watchPingAt >= WATCH_PING_MS) {
       conn.watchPingAt = now;
-      send({ t: 'ping' });
+      sendPing();
     }
   }
 
@@ -294,7 +320,8 @@ var LegioClient = (function () {
       case 'peer': return onPeer(m);
       case 'left': return onLeft(m);
       case 'error': return onError(m);
-      default: return undefined;   // pong and anything unknown
+      case 'pong': return onPong();
+      default: return undefined;   // anything unknown
     }
   }
 
@@ -423,7 +450,10 @@ var LegioClient = (function () {
   }
 
   function onError(m) {
-    const msg = typeof m.msg === 'string' && m.msg ? m.msg.slice(0, 200) : 'Something went wrong.';
+    // 'too_many_rooms' and 'rate' (also sent for wrong room codes) are plain notices: the server's text is shown
+    const fallback = m.code === 'too_many_rooms' ? 'The server is full of rooms right now. Try again in a while.'
+      : m.code === 'rate' ? 'Too many attempts. Wait a moment and try again.' : 'Something went wrong.';
+    const msg = typeof m.msg === 'string' && m.msg ? m.msg.slice(0, 200) : fallback;
     if (m.code === 'rejoin_failed') return rejoinFailed(msg);
     if (m.code === 'shutdown') return onShutdown(msg);
     showError(msg);
@@ -502,9 +532,22 @@ var LegioClient = (function () {
     clearTimeout(leaveTimer);
   }
 
+  // Quit asks in the page (no native confirm(): it returns false at once where dialogs are blocked).
+  // "Yes, quit" ignores clicks right after the question appeared, so a double-click cannot pass it.
   function quitGame() {
-    const ask = 'Quit this game? You will forfeit.';
-    if (typeof confirm === 'function' && !confirm(ask)) return;
+    if (quitAskAt) closeQuitAsk(); else openQuitAsk();
+  }
+  function openQuitAsk() {
+    quitAskAt = Date.now();
+    show('quitAsk', true);
+  }
+  function closeQuitAsk() {
+    quitAskAt = 0;
+    show('quitAsk', false);
+  }
+  function confirmQuit() {
+    if (!quitAskAt || Date.now() - quitAskAt < QUIT_GUARD_MS) return;
+    closeQuitAsk();
     leaveRoom();
   }
 
@@ -578,6 +621,7 @@ var LegioClient = (function () {
     const on = (screen === 'battle' || screen === 'camp') && !(endShown && endLeave);
     el.style.display = on ? 'block' : 'none';
     el.className = 'quiet mini' + (screen === 'camp' ? ' onMap' : '');
+    if (!on) closeQuitAsk();
   }
 
   function setHelp(on) {
@@ -712,9 +756,9 @@ var LegioClient = (function () {
     return battle.regs.filter(r => selected.has(r.id) && isMine(r) && fit(r)).slice(0, MAX_ORDER_UNITS);
   }
 
-  // Nearest regiment accepted by `pred` within the hit radius (at least 18 px on small screens).
-  function regimentAt(x, y, pred) {
-    let best = null, bd = Math.max(HIT_RADIUS, 18 / view.scale);
+  // Nearest regiment accepted by `pred` within the hit radius (at least minPx screen pixels on small screens).
+  function regimentAt(x, y, pred, minPx) {
+    let best = null, bd = Math.max(HIT_RADIUS, (minPx || 18) / view.scale);
     for (const r of battle.regs) {
       if (r.state === 'dead' || !pred(r)) continue;
       const d = Math.hypot(r.x - x, r.y - y);
@@ -805,10 +849,15 @@ var LegioClient = (function () {
   function cancelPointer() {
     pointer.box = null;
     pointer.line = null;
+    touch.id = null;
   }
 
+  // A touch is followed by compatibility mouse events (mousedown/up at the same spot): they must not
+  // select or deselect on top of what the tap already did.
+  const afterTouch = () => ticks() - touch.last < MOUSE_AFTER_TOUCH_MS;
+
   function onMouseDown(e) {
-    if (screen !== 'battle' || helpOpen) return;
+    if (screen !== 'battle' || helpOpen || afterTouch()) return;
     const w = toWorld(e);
     if (!isNum(w.x) || !isNum(w.y)) return;
     if (e.button === 0) pointer.box = { x0: w.x, y0: w.y, x1: w.x, y1: w.y, shift: !!e.shiftKey };
@@ -828,6 +877,7 @@ var LegioClient = (function () {
   }
 
   function onMouseUp(e) {
+    if (afterTouch()) return cancelPointer();
     if (e.button === 0 && pointer.box) { const b = pointer.box; pointer.box = null; finishBox(b); }
     if (e.button === 2 && pointer.line) { const l = pointer.line; pointer.line = null; finishRightClick(l); }
   }
@@ -855,6 +905,53 @@ var LegioClient = (function () {
     if (foe) orderAttack(regs, foe); else orderMove(regs, l.x0, l.y0);
   }
 
+  // ---------- touch ----------
+  // Pointer events with pointerType 'touch' only, so a mouse (also on a hybrid device) behaves as before.
+  // A tap (short, hardly moved) on one of my regiments toggles it; with a selection, a tap on a live
+  // enemy attacks it and a tap on the ground sends the same formation-keeping move as a right-click.
+  const isTouch = e => !!e && e.pointerType === 'touch';
+
+  function onTouchDown(e) {
+    if (!isTouch(e)) return;
+    touch.last = ticks();
+    if (screen !== 'battle' || helpOpen) return;
+    // a second finger (pinch) is not a tap; a finger whose release we never saw is forgotten after 2 s
+    if (touch.id !== null && touch.id !== e.pointerId && ticks() - touch.at < 2000) { touch.id = null; return; }
+    cancelPointer();   // (also forgets any older finger)
+    touch.id = e.pointerId; touch.x = e.clientX; touch.y = e.clientY; touch.at = ticks();
+    if (typeof e.preventDefault === 'function') e.preventDefault();   // no compatibility mouse events
+  }
+
+  function onTouchUp(e) {
+    if (!isTouch(e)) return;
+    touch.last = ticks();
+    if (touch.id === null || touch.id !== e.pointerId) return;
+    const moved = Math.hypot(e.clientX - touch.x, e.clientY - touch.y), held = ticks() - touch.at;
+    touch.id = null;
+    if (screen !== 'battle' || helpOpen || moved > TAP_MOVE_PX || held > TAP_MAX_MS) return;
+    const w = toWorld(e);
+    if (isNum(w.x) && isNum(w.y)) tapField(w);
+  }
+
+  function onTouchCancel(e) {
+    if (!isTouch(e)) return;
+    touch.last = ticks();
+    if (touch.id === e.pointerId) touch.id = null;
+  }
+
+  function tapField(w) {
+    const r = regimentAt(w.x, w.y, fit, TAP_HIT_PX);   // the nearest regiment that can still act or be attacked
+    if (r && isMine(r)) {
+      if (selected.has(r.id)) selected.delete(r.id); else selected.add(r.id);
+      return updateCards();
+    }
+    const regs = selectedRegs();
+    if (!battle.live || !regs.length) return;
+    if (r) return orderAttack(regs, r);
+    const p = onField(w);
+    orderMove(regs, p.x, p.y);
+  }
+
   // ---------- keyboard ----------
   function isTyping(e) {
     const t = e.target, tag = t && typeof t.tagName === 'string' ? t.tagName.toUpperCase() : '';
@@ -870,6 +967,7 @@ var LegioClient = (function () {
   function onKeyDown(e) {
     if (typeof e.key !== 'string' || isTyping(e)) return;
     const k = e.key.toLowerCase();
+    if (quitAskAt && k === 'escape') { closeQuitAsk(); e.preventDefault(); return; }
     if (helpOpen) {
       if (k === 'escape' || k === 'h' || k === '?') { setHelp(false); e.preventDefault(); }
       return;
@@ -971,9 +1069,27 @@ var LegioClient = (function () {
     const r = el ? battle.byId.get(Number(el.getAttribute('data-id'))) : null;
     return r && isMine(r) && fit(r) ? r : null;
   }
+  function onCardDown(e) {
+    cardPtr.type = e && typeof e.pointerType === 'string' ? e.pointerType : '';
+    cardPtr.at = ticks();
+    if (cardPtr.type === 'touch') touch.last = cardPtr.at;
+  }
   function onCardClick(e) {
     const r = cardRegiment(e);
     if (!r) return;
+    // touch: a tap toggles the card, a double-tap selects every regiment of that type (a phone sends no
+    // reliable dblclick). A click that follows a mouse press keeps the old behaviour.
+    const byTouch = e.pointerType === 'touch' || (cardPtr.type === 'touch' && ticks() - cardPtr.at < 1500);
+    if (byTouch) {
+      const now = ticks();
+      if (touch.tapType === r.type && now - touch.tapAt < DOUBLE_TAP_MS) {
+        touch.tapType = ''; touch.tapAt = -1e9;
+        return selectWhere(q => q.type === r.type, false);
+      }
+      touch.tapType = r.type; touch.tapAt = now;
+      if (selected.has(r.id)) selected.delete(r.id); else selected.add(r.id);
+      return updateCards();
+    }
     if (!e.shiftKey) selected.clear();
     selected.add(r.id);
     updateCards();
@@ -1029,8 +1145,11 @@ var LegioClient = (function () {
     ctx.beginPath(); ctx.moveTo(battle.W / 2, 0); ctx.lineTo(battle.W / 2, battle.H); ctx.stroke();
     ctx.setLineDash([]);
     if (!battle.regs.length) return;
-    // "paused" is only honest while frames (pongs, peer notices) still arrive; a silent link is no pause
-    const note = !battle.live ? '' : Date.now() - conn.lastRx > NO_SIGNAL_MS ? 'no signal'
+    // "paused" is only honest while frames (pongs, peer notices) still arrive; a silent link is no pause.
+    // 'no signal' waits for max(6 s, 4 round trips) of silence, and never shows while the opponent-
+    // disconnected banner is up (the server has the game paused and answers only the occasional ping).
+    const noSignal = !(peer.lost && room) && Date.now() - conn.lastRx > noSignalMs();
+    const note = !battle.live ? '' : noSignal ? 'no signal'
       : ticks() - battle.simAt > PAUSE_NOTE_MS ? 'paused' : '';
     if (note !== battle.pauseNote) { battle.pauseNote = note; updateHud(); }
     placeRegiments();
@@ -1167,18 +1286,25 @@ var LegioClient = (function () {
     listen('btnCampAI', 'click', () => menuSend({ t: 'practice', name: playerName(), mode: 'campaign' }));
     listen('btnJoin', 'click', joinRoom);
     listen('code', 'keydown', e => { if (e.key === 'Enter') joinRoom(); });
+    listen('code', 'input', () => setText('err', ''));   // typing again clears an old notice
     listen('btnReady', 'click', () => { if (menuSend({ t: 'ready' })) $('btnReady').disabled = true; });
     listen('btnLeave', 'click', leaveRoom);
     listen('btnForget', 'click', leaveRoom);
     listen('btnQuit', 'click', quitGame);
+    listen('btnQuitYes', 'click', confirmQuit);
+    listen('btnQuitNo', 'click', closeQuitAsk);
     listen('btnAgain', 'click', returnToLobby);
     listen('btnHelp', 'click', () => setHelp(true));
     listen('btnHowTo', 'click', () => setHelp(true));
     listen('btnHelpClose', 'click', () => setHelp(false));
     listen('help', 'click', e => { if (e.target === $('help')) setHelp(false); });   // click outside the box
     listen('cv', 'mousedown', onMouseDown);
+    listen('cv', 'pointerdown', onTouchDown);
+    listen('cv', 'pointerup', onTouchUp);
+    listen('cv', 'pointercancel', onTouchCancel);
     listen(window, 'contextmenu', e => { if (screen === 'battle') e.preventDefault(); });
     listen('cards', 'mousedown', e => e.preventDefault());   // no text selection, no focus theft
+    listen('cards', 'pointerdown', onCardDown);
     listen('cards', 'click', onCardClick);
     listen('cards', 'dblclick', onCardDouble);
     listen(window, 'mousemove', onMouseMove);
